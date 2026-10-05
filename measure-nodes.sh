@@ -47,22 +47,25 @@ for entry in "${NODES[@]}"; do
         continue
     fi
 
-    # 只取 RTT 数值列（形如 rtt min/avg/max/mdev = 1.59/1.94/2.63/0.49 ms）
-    line="$(ping -c "$PING_COUNT" -W 2 -q "$host" 2>/dev/null | tail -1)"
+    # -q 模式下输出两行摘要：丢包率一行、rtt 一行。
+    # 必须整段保存后分别提取，只取 tail -1 只会拿到 rtt 行，丢包列就全是 ?。
+    raw="$(ping -c "$PING_COUNT" -W 2 -q "$host" 2>/dev/null)"
+    line="$(tail -1 <<< "$raw")"
     if [ -z "$line" ]; then
         printf '  %-18s %-12s %s\n' "$name" "不可达" "-"
         continue
     fi
 
     med="$(awk -F'= ' '/= /{split($2,a,"/"); print a[2]}' <<< "$line")"
-    loss="$(grep -oE '[0-9]+% packet loss' <<< "$line" | grep -oE '^[0-9]+' || echo "?")"
+    loss="$(grep -oE '[0-9]+% packet loss' <<< "$raw" | grep -oE '^[0-9]+' || true)"
+    [ -n "$loss" ] || loss="?"
 
     if [ -z "$med" ]; then
         printf '  %-18s %-12s %s\n' "$name" "解析失败" "$loss%"
         continue
     fi
 
-    printf '  %-18s %-12s %s\n' "$name" "${med} ms" "$loss%"
+    printf '  %-18s %-12s %s\n' "$name" "${med} ms" "${loss}%"
     ORDER+=("$med|$name")
 done
 
@@ -83,33 +86,29 @@ printf '\n\n'
 
 # 分档规则：
 #   第 1 档 = 前 2 个（延迟最低，日常轮换在这两档间进行）
-#   第 2、3 档 = 其余各一个，按延迟顺序（谁快谁先降级过去）
+#   第 2 档起 = 其余各一个，按延迟顺序（谁快谁先降级过去）
 # 只有 1 个节点可用时，全部放同一档。
+#
+# 用数组收集而不是拼字符串：拼字符串时多行内容只有首行能带上 heredoc 的前缀缩进，
+# 输出就会变成首行多缩进、其余行少缩进，粘回源码里很难看。
+TIER_LINES=()
 if [ "$n" -le 1 ]; then
-    only="${LINES[0]#*$'\t'}"
-    body="    [\"$only\"],"
+    TIER_LINES+=("[\"${LINES[0]#*$'\t'}\"],")
 elif [ "$n" -eq 2 ]; then
-    a="${LINES[0]#*$'\t'}"; b="${LINES[1]#*$'\t'}"
-    body="    [\"$a\", \"$b\"],"
+    TIER_LINES+=("[\"${LINES[0]#*$'\t'}\", \"${LINES[1]#*$'\t'}\"],")
 else
-    a="${LINES[0]#*$'\t'}"; b="${LINES[1]#*$'\t'}"
-    body="    [\"$a\", \"$b\"],"
+    TIER_LINES+=("[\"${LINES[0]#*$'\t'}\", \"${LINES[1]#*$'\t'}\"],")
     for ((i = 2; i < n; i++)); do
-        body="$body"$'\n'"    [\"${LINES[$i]#*$'\t'}\"],"
+        TIER_LINES+=("[\"${LINES[$i]#*$'\t'}\"],")
     done
 fi
 
-cat <<TIP
-
-  粘贴到 rotate.py，替换掉原来的 TIERS = [...] 整块：
-
-  ─────────────────────────────────────────────────
-  TIERS = [
-  $body
-  ]
-  ─────────────────────────────────────────────────
-
-TIP
+printf '\n  粘贴到 rotate.py，替换掉原来的 TIERS = [...] 整块：\n\n'
+printf '  ─────────────────────────────────────────────────\n'
+printf '  TIERS = [\n'
+for t in "${TIER_LINES[@]}"; do printf '    %s\n' "$t"; done
+printf '  ]\n'
+printf '  ─────────────────────────────────────────────────\n\n'
 
 if [ "$n" -lt 4 ]; then
     c_warn "  只有 $n 个节点可用，TIERS 将只包含这些。查原因：出网被限 / DNS 异常 / 节点下线。"
