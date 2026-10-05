@@ -1,0 +1,27 @@
+[Unit]
+Description=mihomo 内核（Surfshark 出口）
+Documentation=https://wiki.metacubex.one/
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# 以 root 运行：创建 TUN 设备需要 CAP_NET_ADMIN，VPS 上没有别的选择。
+# 如需降权运行可加 User=，但该用户必须能读写 /dev/net/tun。
+WorkingDirectory=/opt/surfshark-rotate
+ExecStart=/opt/surfshark-rotate/mihomo -d /opt/surfshark-rotate
+Restart=always
+RestartSec=5s
+LimitNOFILE=1048576
+
+# 每次停止后清理可能残留的策略路由。
+# mihomo 被 OOM 或 SIGKILL 时不会自己清理，残留规则会让整机流量
+# 指向不存在的 TUN 设备，表现为 SSH 突然断连且无法自行恢复。
+ExecStopPost=/opt/surfshark-rotate/cleanup-routes.sh
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mihomo
+
+[Install]
+WantedBy=multi-user.target

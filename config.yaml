@@ -1,0 +1,143 @@
+# ==============================================================
+#  Surfshark 亚洲节点 — mihomo 配置（Linux / VPS 版）
+#
+#  整机分流：只有 opencode.ai 与 ip.sb 走代理并每 5 分钟换一次出口 IP，
+#  其余全部直连。与 Windows 版分流规则一致。
+#
+#  下方 secret、route-exclude-address、WG_PRIVATE_KEY 三处占位符由 install.sh 填充，
+#  本文件不可直接使用。
+#
+#  【私钥不进版本库】private-key 是你 Surfshark 账号的真实私钥，4 个节点共用同一个。
+#  它由 install.sh 从 surfshark.key 文件或 SURFSHARK_WG_KEY 环境变量注入，
+#  surfshark.key 已列入 .gitignore。public-key 是公钥，公开无妨。
+# ==============================================================
+
+mixed-port: 7897
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+
+# 控制接口只监听本机。rotate.py 用它切节点和热重载。
+# 绝对不要改成 0.0.0.0 —— 那等于把节点控制权挂到公网。
+external-controller: 127.0.0.1:9097
+secret: "@@SECRET@@"
+
+# --------------------------------------------------------------
+#  TUN：整机分流在这里生效
+# --------------------------------------------------------------
+tun:
+  enable: true
+  # Linux 有原生协议栈，官方文档明确 system 栈"更稳定、资源占用更低"。
+  # （Windows 上用 gvisor 是因为 Windows TUN 驱动栈不同，这里不照搬。）
+  stack: system
+  device: Mihomo
+  auto-route: true
+  auto-detect-interface: true
+  dns-hijack:
+    - any:53
+  # MTU 由 install.sh 按本机实际网卡 MTU 推算填入：网卡 MTU − 60（WireGuard 开销）。
+  # 写死是错的 —— 各云厂商网卡 MTU 不同（1500/1460/1400 都有），
+  # 照抄别处的值会导致外层包超网卡 MTU 而分片，或直接黑洞。
+  # 与下面 proxy 的 mtu 必须同值。
+  mtu: "@@MTU@@"
+  # 【保 SSH 的关键】把 VPS 自身地址排除在 TUN 之外。
+  # 这样 SSH 流量根本不进 mihomo —— 即使内核进程崩了，SSH 也不会被劫持。
+  # install.sh 会填入：本机全部 IPv4、默认路由源地址、公网出口 IP、
+  # 以及几家云厂商的元数据地址（避免 TUN 劫持 169.254.169.254 拿不到凭据）。
+  route-exclude-address:
+@@ROUTE_EXCLUDE@@
+
+dns:
+  enable: true
+  ipv6: false
+  # 与 Windows 版保持一致，不改成 fake-ip。
+  # 实测 redir-host 在本方案下工作正常，没有证据就不动它。
+  enhanced-mode: redir-host
+  nameserver:
+    - 223.5.5.5
+    - 1.1.1.1
+  fallback:
+    - 8.8.8.8
+
+# --------------------------------------------------------------
+#  节点（由 Surfshark 原生 WireGuard 配置转换，与 Windows 版逐字相同）
+# --------------------------------------------------------------
+proxies:
+  - name: "JP 日本-东京"
+    type: wireguard
+    server: jp-tok.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: "@@WG_PRIVATE_KEY@@"
+    public-key: "YJSjrc/WWOjQUyUi4iYcHb7LsWWoCY+2fK8/8VtC/BY="
+    mtu: "@@MTU@@"
+    udp: true
+
+  - name: "KR 韩国-首尔"
+    type: wireguard
+    server: kr-seo.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: "@@WG_PRIVATE_KEY@@"
+    public-key: "bD/m2mdKxJXG2wTkLsmWpiW8xZwkDdrrrwC44auOhQg="
+    mtu: "@@MTU@@"
+    udp: true
+
+  - name: "SG 新加坡"
+    type: wireguard
+    server: sg-sng.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: "@@WG_PRIVATE_KEY@@"
+    public-key: "MGfgkhJsMVMTO33h1wr76+z6gQr/93VcGdClfbaPsnU="
+    mtu: "@@MTU@@"
+    udp: true
+
+  - name: "TW 台湾-台北"
+    type: wireguard
+    server: tw-tai.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: "@@WG_PRIVATE_KEY@@"
+    public-key: "P0vaGUOUE7V5bbGOYY2WgQeZnTZEHvIr+dfebU7W4Ao="
+    mtu: "@@MTU@@"
+    udp: true
+
+# --------------------------------------------------------------
+#  策略组
+#   FAST  — 只含日韩（实测延迟最低的两档），url-test 自动挑快的
+#   PROXY — 轮换脚本操作的组，成员顺序即优先级
+# --------------------------------------------------------------
+proxy-groups:
+  - name: "FAST"
+    type: url-test
+    proxies:
+      - "JP 日本-东京"
+      - "KR 韩国-首尔"
+    url: "http://cp.cloudflare.com/"
+    interval: 300
+    tolerance: 50
+
+  - name: "PROXY"
+    type: select
+    proxies:
+      - "JP 日本-东京"
+      - "KR 韩国-首尔"
+      - "SG 新加坡"
+      - "TW 台湾-台北"
+      - "FAST"
+
+# --------------------------------------------------------------
+#  分流
+#    规则顺序 = 安全优先级，倒数第二条是 VPS 专属加固。
+# --------------------------------------------------------------
+rules:
+  # 【VPS 专属】SSH 永远直连。这是 route-exclude-address 之外的第二道保险：
+  # 万一排除列表没覆盖到某条路径，这条规则仍能保住你的远程连接。
+  - DST-PORT,22,DIRECT
+  - DOMAIN-SUFFIX,opencode.ai,PROXY
+  - DOMAIN-SUFFIX,ip.sb,PROXY     # 仅供轮换脚本查出口 IP
+  - MATCH,DIRECT

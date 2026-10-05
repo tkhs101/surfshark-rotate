@@ -1,0 +1,20 @@
+[Unit]
+Description=Surfshark 出口 IP 轮换（单次执行）
+Documentation=file:/opt/surfshark-rotate/README.md
+After=mihomo.service network-online.target
+Wants=network-online.target
+
+# 这里刻意不用 Requires=mihomo.service：
+# 万一 mihomo 挂了，本服务仍要被触发，才能由 rotate.py 的自愈逻辑
+# 把它拉起来。用 Requires 会让 mihomo 启动失败时本服务也直接被跳过。
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/surfshark-rotate
+ExecStart=/usr/bin/python3 /opt/surfshark-rotate/rotate.py
+
+# 正常一轮约 7 秒。出口 IP 探测最长 25 秒，自愈最长 60 秒，放宽到 180 秒，
+# 避免 systemd 在自愈途中把本服务判为超时并杀掉。
+
+[Install]
+WantedBy=multi-user.target

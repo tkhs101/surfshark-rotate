@@ -1,0 +1,23 @@
+# ==============================================================
+#  Surfshark 账号的 WireGuard 私钥 —— 绝不进版本库
+#  私钥由 install.sh 从这个文件（或环境变量 SURFSHARK_WG_KEY）注入。
+#  一旦提交进 git，即使之后删除，历史记录里依然留存，等于永久泄露。
+# ==============================================================
+surfshark.key
+
+# 安装产物
+mihomo
+mihomo.gz
+mihomo.new
+
+# 运行状态与日志
+.rotate_state.json
+rotate.log
+
+# 配置备份（万一有人把生成出来的、含私钥的配置拷进仓库）
+config.yaml.bak-*
+*.local.yaml
+
+# 杂项
+__pycache__/
+*.pyc
