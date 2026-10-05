@@ -41,8 +41,10 @@ tun:
   # MTU 由 install.sh 按本机实际网卡 MTU 推算填入：网卡 MTU − 60（WireGuard 开销）。
   # 写死是错的 —— 各云厂商网卡 MTU 不同（1500/1460/1400 都有），
   # 照抄别处的值会导致外层包超网卡 MTU 而分片，或直接黑洞。
+  # 注意：占位符不能加引号。写成 "@@MTU@@" 的话，替换后会变成字符串 "1400"，
+  # 而 mihomo 要求 uint32，直接报 cannot unmarshal !!str into uint32。
   # 与下面 proxy 的 mtu 必须同值。
-  mtu: "@@MTU@@"
+  mtu: @@MTU@@
   # 【保 SSH 的关键】把 VPS 自身地址排除在 TUN 之外。
   # 这样 SSH 流量根本不进 mihomo —— 即使内核进程崩了，SSH 也不会被劫持。
   # install.sh 会填入：本机全部 IPv4、默认路由源地址、公网出口 IP、
@@ -73,7 +75,7 @@ proxies:
     ip: 10.14.0.2
     private-key: "@@WG_PRIVATE_KEY@@"
     public-key: "YJSjrc/WWOjQUyUi4iYcHb7LsWWoCY+2fK8/8VtC/BY="
-    mtu: "@@MTU@@"
+    mtu: @@MTU@@
     udp: true
 
   - name: "KR 韩国-首尔"
@@ -83,7 +85,7 @@ proxies:
     ip: 10.14.0.2
     private-key: "@@WG_PRIVATE_KEY@@"
     public-key: "bD/m2mdKxJXG2wTkLsmWpiW8xZwkDdrrrwC44auOhQg="
-    mtu: "@@MTU@@"
+    mtu: @@MTU@@
     udp: true
 
   - name: "SG 新加坡"
@@ -93,7 +95,7 @@ proxies:
     ip: 10.14.0.2
     private-key: "@@WG_PRIVATE_KEY@@"
     public-key: "MGfgkhJsMVMTO33h1wr76+z6gQr/93VcGdClfbaPsnU="
-    mtu: "@@MTU@@"
+    mtu: @@MTU@@
     udp: true
 
   - name: "TW 台湾-台北"
@@ -103,7 +105,7 @@ proxies:
     ip: 10.14.0.2
     private-key: "@@WG_PRIVATE_KEY@@"
     public-key: "P0vaGUOUE7V5bbGOYY2WgQeZnTZEHvIr+dfebU7W4Ao="
-    mtu: "@@MTU@@"
+    mtu: @@MTU@@
     udp: true
 
 # --------------------------------------------------------------
