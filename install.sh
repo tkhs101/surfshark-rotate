@@ -284,7 +284,7 @@ MTU = max(1280, min(NIC_MTU - WG_OVERHEAD, 1500))   # 下限 1280 保 IPv6 可�
 out = [f"    - {ip}/32" for ip in sorted(ips)]
 out += [f"    - {c}" for c in CIDRS]
 print("\n".join(out))
-mtu_out.write_text(f"{MTU}\n{NIC_DESC}\n", encoding="utf-8")
+mtu_out.write_text(f"{MTU}\n{NIC_DESC}\n{WG_OVERHEAD}\n", encoding="utf-8")
 for n in notes:
     print(f"# {n}", file=sys.stderr)
 PY
@@ -292,6 +292,10 @@ PY
 
 MTU="$(sed -n 1p "$MTU_FILE")"
 MTU_DESC="$(sed -n 2p "$MTU_FILE")"
+# WG_OVERHEAD 只定义在上面的 Python 里，shell 侧没有这个变量。
+# 直接在 shell 里写 $WG_OVERHEAD 会被 set -u 当成未绑定变量而中止脚本 ——
+# 实测踩过：全新安装时死在这一行，config 已写好但后续步骤全没执行。
+WG_OVERHEAD="$(sed -n 3p "$MTU_FILE")"
 rm -f "$MTU_FILE"
 [ -n "$MTU" ] || die "未能探测出本机 MTU，拒绝安装。诊断：ip link show"
 
