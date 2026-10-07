@@ -174,8 +174,9 @@ proxies:
 
 # --------------------------------------------------------------
 #  策略组
-#   FAST  — 只含日韩（实测延迟最低的两档），url-test 自动挑快的
-#   PROXY — 轮换脚本操作的组，成员顺序即优先级
+#   FAST     — 只含日韩（实测延迟最低的两档），url-test 自动挑快的
+#   PROXY    — 轮换脚本操作的组，成员顺序即优先级
+#   AUTOFALL — 降级链：PROXY 整个不健康时退到 DIRECT，恢复后自动切回
 # --------------------------------------------------------------
 proxy-groups:
   - name: "FAST"
@@ -196,14 +197,50 @@ proxy-groups:
       - "TW 台湾-台北"
       - "FAST"
 
+  # --------------------------------------------------------------
+  #  降级链：节点全挂时自动退到直连，节点恢复后自动切回
+  #
+  #  【为什么必须有】WireGuard 私钥到期或节点全挂时，PROXY 是 select 组，
+  #  mihomo 不会自动回退 —— opencode.ai 与 ip.sb 会直接连不上：
+  #      dial PROXY ... context deadline exceeded
+  #  也就是说密钥一过期，本项目唯一的产出（IP 轮换）就整体停摆，
+  #  而除了翻 journal 没有别的信号能发现。
+  #
+  #  AUTOFALL 是 fallback 组，成员顺序即优先级，取第一个健康的：
+  #  PROXY 健康时永远选它，只有整个 PROXY 组都不健康才落到 DIRECT。
+  #  PROXY 组本身不动，rotate.py 照旧操作它。
+  #
+  #  实测（真实内核 v1.19.32）：
+  #    节点全死    → AUTOFALL 选中 DIRECT，请求正常发出
+  #    节点恢复后  → 下一轮健康检查自动切回 PROXY，无需人工干预
+  #
+  #  lazy: false 是刻意的。默认 lazy: true 会在每条连接路由时触发健康检查，
+  #  而每轮轮换都要热重载重建隧道 —— 实测重建只要 0.2~0.7 秒，
+  #  远小于下面的 interval，所以定周期检查几乎撞不上重建窗口
+  #  （3 轮真实轮换、每轮 26 秒采样 126 次，零误降级）。
+  #  但 lazy 会让每个恰好落在重建窗口里的新连接都被判成节点已死而送去直连。
+  - name: "AUTOFALL"
+    type: fallback
+    proxies:
+      - "PROXY"
+      - "DIRECT"     # 必须放最后：fallback 取第一个健康的成员
+    url: "http://cp.cloudflare.com/"
+    interval: 60
+    lazy: false
+
 # --------------------------------------------------------------
 #  分流
 #    规则顺序 = 安全优先级，倒数第二条是 VPS 专属加固。
+#
+#    这里指向 AUTOFALL 而不是 PROXY，是为了让「节点全挂」有个明确的降级出口：
+#    私钥到期时 opencode.ai 会退到直连（还能用，只是出口变回本机），
+#    而不是直接连不上。rotate.py 会在同一轮发现降级并停掉轮换定时器，
+#    详见 AUTOFALL 组的注释。
 # --------------------------------------------------------------
 rules:
   # 【VPS 专属】SSH 永远直连。这是 route-exclude-address 之外的第二道保险：
   # 万一排除列表没覆盖到某条路径，这条规则仍能保住你的远程连接。
   - DST-PORT,22,DIRECT
-  - DOMAIN-SUFFIX,opencode.ai,PROXY
-  - DOMAIN-SUFFIX,ip.sb,PROXY     # 仅供轮换脚本查出口 IP
+  - DOMAIN-SUFFIX,opencode.ai,AUTOFALL
+  - DOMAIN-SUFFIX,ip.sb,AUTOFALL     # 仅供轮换脚本查出口 IP
   - MATCH,DIRECT

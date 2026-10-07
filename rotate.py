@@ -51,7 +51,20 @@ MIXED_PORT = 7897                     # mixed-port
 MIXED_HOST = "127.0.0.1"
 IP_PROBE_HOST = "ip.sb"               # 必须在分流规则内，否则测到的是本机真实 IP
 
+# 降级链。config.yaml 里 AUTOFALL 是 fallback 组，成员 [PROXY, DIRECT]：
+# PROXY 整个不健康时它自动选中 DIRECT，节点恢复后再自动切回 PROXY。
+# 也就是说「密钥到期 → opencode.ai 连不上」这个故障被内核层面消掉了，
+# 本模块负责的是控制面：发现降级、停掉没意义的轮换、把状态告诉人。
+AUTOFALL = "AUTOFALL"
+DEGRADED_TO = "DIRECT"
+
+# 连续多少轮取不到出口 IP 就判定为节点全挂。
+# 不能是 1：单轮取不到可能只是某个 CDN 边缘节点抖动。
+# 也不能太大：定时器 5 分钟一轮，3 轮就是 15 分钟无谓的空转。
+DEGRADE_AFTER_FAILS = 2
+
 MIHOMO_SERVICE = "mihomo.service"     # 自愈时重启的目标
+ROTATE_TIMER = "surfshark-rotate.timer"   # 降级时停掉；由 on-mihomo-up.sh 钩子启回
 HEAL = os.environ.get("ROTATE_HEAL", "1") != "0"   # --no-heal 可临时关掉
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -257,6 +270,68 @@ def conns_on(node):
                if isinstance(c, dict) and node in (c.get("chains") or []))
 
 
+# ------------------------------------------------------------
+#  降级状态
+# ------------------------------------------------------------
+def autofall_now():
+    """AUTOFALL 组当前选中的出站。
+
+    返回 "DIRECT" 表示节点全挂、已降级到直连。
+    老版本 config.yaml 没有 AUTOFALL 组，返回 None —— 调用方按「未降级」处理。
+    """
+    try:
+        return api("/proxies/" + AUTOFALL)["now"]
+    except Exception:
+        return None
+
+
+def is_degraded():
+    return autofall_now() == DEGRADED_TO
+
+
+def mark_degraded(state, reason):
+    """进入降级态：记状态、停掉没意义的轮换定时器、把恢复步骤打出来。
+
+    停定时器是对的：此时切节点、热重载、探测出口 IP 全都做不出结果，
+    每 5 分钟重试一次只是空转。恢复由 on-mihomo-up.sh 钩子负责 ——
+    换私钥必然要 restart mihomo，钩子会在那里把定时器启回来。
+    """
+    was = state.get("degraded")
+    state["degraded"] = True
+    state["degraded_reason"] = reason
+    state["degraded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(state)
+
+    if was is not True:
+        log("!! 进入降级态：%s" % reason)
+        log("   节点全挂，opencode.ai / ip.sb 已自动退到直连（还能用，但出口变回本机）")
+        log("   IP 轮换已停摆 —— 这是本项目唯一的产出，现在等于空转")
+    if os.path.exists("/run/systemd/system"):
+        r = subprocess.run(["systemctl", "stop", ROTATE_TIMER],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode == 0:
+            log("   已停掉定时器 %s" % ROTATE_TIMER)
+        else:
+            log("   ⚠ 停定时器失败（%s）：%s" % (ROTATE_TIMER, (r.stderr or "").strip()[:160]))
+    log("   恢复步骤：")
+    log("     1. 换新的 Surfshark WireGuard 私钥（config.yaml 里 private-key，4 处共用同一个）")
+    log("     2. sudo systemctl restart mihomo")
+    log("        钩子会在 mihomo 起来后复查：若节点已恢复，自动重新启用 %s" % ROTATE_TIMER)
+    log("        （mihomo 自己的健康检查最多再花 1 个 interval 才切回，不必等它先跑完）")
+    log("     3. 若 1 分钟内没自动恢复，手工执行：sudo systemctl start %s" % ROTATE_TIMER)
+    return False
+
+
+def clear_degraded(state):
+    if state.get("degraded") or state.get("fail_streak"):
+        state.pop("degraded", None)
+        state.pop("degraded_reason", None)
+        state.pop("degraded_at", None)
+        state["fail_streak"] = 0
+        save_state(state)
+        log("    已退出降级态，轮换恢复")
+
+
 def heal_mihomo():
     """mihomo 挂了就把它拉起来。VPS 上没有 Clash Verge 兜底，这一步是必需的。"""
     if not HEAL:
@@ -342,6 +417,14 @@ def rotate_once(dry_run=False):
             return False
 
     tier, target = pick_next(state)
+
+    # 降级检测放在最前面：本轮什么都不做就返回。
+    # 理由是降级态下切节点、热重载、探测出口 IP 全都做不出结果 ——
+    # 继续跑只是每 5 分钟空转一次，还会把降级状态冲掉。
+    # 放在 current_node() 之后是因为要先确认 API 通。
+    if is_degraded():
+        return mark_degraded(state, "AUTOFALL 已选中 DIRECT（节点全挂）")
+
     old_ip = state.get("last_ip")
     log(f"--- 轮换开始 | 当前节点={live} | 档位={tier+1}/{len(TIERS)} "
         f"({TIERS[tier][0]}...) ---")
@@ -392,9 +475,35 @@ def rotate_once(dry_run=False):
         return True
 
     new_ip = exit_ip()
-    log(f"    出口IP：{old_ip or '(未知)'} -> {new_ip or '(取不到)'}")
 
-    if old_ip and new_ip and new_ip == old_ip:
+    # ---- 取不到出口 IP ----
+    # 这条分支必须单独处理。原实现在这里是 new_ip=None 落进 else 分支，
+    # 然后照样打印「完成」并 return True —— 隧道早就死了，日志却写着成功，
+    # 定时器每 5 分钟空转一次，没有任何告警。
+    # 失败方向是「无事发生」，比「连不上」更难察觉。
+    if new_ip is None:
+        streak = int(state.get("fail_streak") or 0) + 1
+        state["fail_streak"] = streak
+        log(f"    出口IP：{old_ip or '(未知)'} -> (取不到)   连续第 {streak} 次失败")
+        if streak >= DEGRADE_AFTER_FAILS:
+            log(f"    连续 {streak} 轮取不到出口 IP —— 判定节点全挂")
+            return mark_degraded(state, f"连续 {streak} 轮取不到出口 IP")
+        # last_ip 必须保留上一次已知的正常出口。
+        # 写成 None 的话，等密钥换好之后 old_ip 为空，
+        # 「IP 没变就降档」的判断会被跳过，分档逻辑整个失准。
+        state["last_ip"] = old_ip
+        save_state(state)
+        log(f"--- 结束 | 节点={target} | 出口IP=(取不到) | "
+            f"连续失败 {streak}/{DEGRADE_AFTER_FAILS} ---")
+        return False
+
+    # 取到了：任何降级痕迹都清掉
+    if state.get("degraded") or state.get("fail_streak"):
+        clear_degraded(state)
+
+    log(f"    出口IP：{old_ip or '(未知)'} -> {new_ip}")
+
+    if old_ip and new_ip == old_ip:
         log("    IP 未变化 → 降到下一档备用节点")
         state["tier"] = tier + 1
         state["idx"] = 0
@@ -418,10 +527,21 @@ def show_status():
         log(f"!! mihomo API 不通：{type(e).__name__}: {e}")
         log("   试试：systemctl status mihomo.service")
         return
-    ip = exit_ip()
     st = load_state()
+    now = autofall_now()
+    degraded = (now == DEGRADED_TO) or bool(st.get("degraded"))
+    ip = exit_ip()
+
+    log(f"降级状态 : {'是' if degraded else '否'}"
+        + (f"  —— {st.get('degraded_reason') or now}（AUTOFALL={now}）" if degraded else ""))
     log(f"当前节点 : {node}")
-    log(f"出口 IP  : {ip or '(取不到)'}")
+    if degraded:
+        # 降级态下 ip.sb 也走直连，测回来的就是这台机器自己的公网 IP。
+        # 这正是「当前没走代理」的直接证据，比任何推断都硬。
+        log(f"出口 IP  : {ip or '(取不到)'}  ← 未走代理，这就是本机公网 IP")
+        log(f"停摆于   : {st.get('degraded_at') or '(未知)'}")
+    else:
+        log(f"出口 IP  : {ip or '(取不到)'}")
     log(f"上次 IP  : {st.get('last_ip') or '(无记录)'}")
     log(f"该节点连接 : {conns_on(node)}")
     log(f"当前档位 : {st.get('tier', 0)+1} / {len(TIERS)}")
@@ -439,9 +559,14 @@ def main():
     if args.no_heal:
         globals()["HEAL"] = False
 
+    # main() 的返回值就是进程退出码，必须往下传。
+    # 不传的话，无论成功、降级、还是取不到出口 IP，systemd 记的都是
+    # ExecMainStatus=0，status.sh 于是永远显示「上一轮轮换结果：成功」——
+    # 故障明明已经写进日志，状态页却说成功。
+    # 这与本模块要解决的「失败方向是无事发生」是同一类问题。
     if args.status:
         show_status()
-        return
+        return 0
 
     if args.loop:
         log(f"=== 轮换器启动，间隔 {args.loop}s，Ctrl+C 停止 ===")
@@ -452,13 +577,14 @@ def main():
                 time.sleep(args.loop)
         except KeyboardInterrupt:
             log("=== 已停止 ===")
-    else:
-        rotate_once(dry_run=args.dry_run)
+        return 0
+
+    return 0 if rotate_once(dry_run=args.dry_run) else 1
 
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except SystemExit:
         raise
     except Exception as e:

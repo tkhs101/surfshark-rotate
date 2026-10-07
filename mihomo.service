@@ -14,6 +14,13 @@ Restart=always
 RestartSec=5s
 LimitNOFILE=1048576
 
+# 恢复钩子：换私钥必然要 restart mihomo，所以这里就是最精确的恢复触发点。
+# 机器处于降级态（节点全挂、rotate.py 已停掉轮换定时器）且节点已恢复时，
+# 把 surfshark-rotate.timer 启回来。正常启动时它立刻返回，零开销。
+# 该脚本保证永远返回 0 —— ExecStartPost 非零退出会让本服务被判 failed，
+# 配上 Restart=always 就会反复重启一个内核完全健康的服务。
+ExecStartPost=/opt/surfshark-rotate/on-mihomo-up.sh
+
 # 每次停止后清理可能残留的策略路由。
 # mihomo 被 OOM 或 SIGKILL 时不会自己清理，残留规则会让整机流量
 # 指向不存在的 TUN 设备，表现为 SSH 突然断连且无法自行恢复。

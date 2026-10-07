@@ -77,6 +77,9 @@ mkdir -p "$BASE"
 
 install -m 0755 "$SRC/rotate.py"          "$BASE/rotate.py"
 install -m 0755 "$SRC/cleanup-routes.sh"  "$BASE/cleanup-routes.sh"
+# mihomo.service 的 ExecStartPost 指向它。漏装的后果不是报错，而是
+# 「密钥换好了但轮换定时器永远是停的」——需要翻半天日志才发现。
+install -m 0755 "$SRC/on-mihomo-up.sh"     "$BASE/on-mihomo-up.sh"
 # 状态速查与卸载脚本也必须落到 $BASE。安装完成的提示里让用户直接跑
 # status.sh，而它并不在上传目录里 —— 交付时漏装，用户照着提示执行会得到
 # "No such file or directory"。实测踩过。
@@ -500,7 +503,7 @@ case "$HIT" in
         ;;
 esac
 
-# ---- 能力校验：纯 IP 建连能不能命中域名规则 ----
+# ---- 能力校验：纯 IP 建连能不能命中域名规则 + 节点全挂时能不能降级 ----
 #
 # 上面的运行时检查证明的是「此刻 opencode.ai 走的是代理」，但它证明不了
 # 「纯 IP 建连也能命中域名规则」。这两件事不等价，实测过：
@@ -509,30 +512,95 @@ esac
 # mihomo，重新建立了 IP->域名映射，于是规则又命中了。
 # 也就是说「sniffer 根本没生效」这个故障可以完全躲过运行时检查。
 #
-# 所以这里再补一个确定性的能力校验：直接检查刚生成、且已通过 mihomo -t
-# 语法检查的 config.yaml 里 sniffer 段是否真的开着。config.yaml 是本脚本
-# 从同目录的 config.yaml 生成的，不存在「用户手改了一份另一套」的可能。
+# 这里做的是确定性的静态校验：直接检查刚生成、且已通过 mihomo -t 语法检查的
+# config.yaml。config.yaml 是本脚本从同目录的 config.yaml 生成的，
+# 不存在「用户手改了一份另一套」的可能。
 SNIFF="$("$PY3" - "$BASE/config.yaml" <<'PY'
-import re, sys, pathlib
-t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-m = re.search(r'(?ms)^sniffer:[ \t]*\n((?:[ \t]+.*\n|[ \t]*\n)*)', t)
-if not m:
-    print("NO_SNIFFER"); raise SystemExit
-blk = m.group(1)
-def flag(name):
-    r = re.search(r'(?m)^[ \t]+' + name + r':[ \t]*(\S+)', blk)
-    return r.group(1).strip('"\'') if r else None
-print("OK" if flag("enable") == "true" and flag("parse-pure-ip") == "true" else "WEAK")
+import sys, pathlib
+
+lines = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+
+
+def indent(s):
+    return len(s) - len(s.lstrip())
+
+
+def block(prefix, want_indent):
+    """取出以 prefix 开头、随后所有更深缩进的行。
+
+    用逐行缩进判断而不是正则：proxy-groups 里的注释也是缩进的，
+    正则很容易一路吃穿到 rules 段去。
+    """
+    out, on = [], False
+    for ln in lines:
+        if not on:
+            if ln.strip() == prefix and indent(ln) == want_indent:
+                on = True
+                out.append(ln)
+            continue
+        if not ln.strip() or indent(ln) > want_indent:
+            out.append(ln)
+            continue
+        break
+    return out
+
+
+def scalar(bl, key):
+    for ln in bl:
+        s = ln.strip()
+        if s.startswith(key):
+            return s.split(":", 1)[1].split("#", 1)[0].strip().strip('"').strip("'")
+    return None
+
+
+def members(bl):
+    out, grab = [], False
+    for ln in bl:
+        s = ln.strip()
+        if s.startswith("proxies:"):
+            grab = True
+            continue
+        if not grab:
+            continue
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("- "):
+            v = s[2:].split("#", 1)[0].strip().strip('"').strip("'")
+            if v:
+                out.append(v)
+            continue
+        grab = False
+    return out
+
+
+sn = block("sniffer:", 0)
+af = block('- name: "AUTOFALL"', 2)
+if not sn or not af:
+    print("NO_SNIFFER")
+elif scalar(af, "type") != "fallback":
+    print("AUTOFALL_NOT_FALLBACK")
+elif members(af) != ["PROXY", "DIRECT"]:
+    print("AUTOFALL_MEMBERS=%s" % (members(af) or "(空)"))
+elif scalar(sn, "enable") == "true" and scalar(sn, "parse-pure-ip") == "true":
+    print("OK")
+else:
+    print("WEAK")
 PY
 )"
 if [ "$SNIFF" = "OK" ]; then
     c_ok "  ✓ 域名嗅探能力已启用（纯 IP 建连也能命中 DOMAIN 规则）"
+    c_ok "  ✓ 降级链已配置（节点全挂时退到直连，恢复后自动切回）"
 else
-    die "config.yaml 的 sniffer 段未正确启用（判定=$SNIFF）。
+    die "config.yaml 的能力校验未通过（判定=$SNIFF）。
+  · WEAK                  → sniffer 段缺 enable: true 或 parse-pure-ip: true
+  · NO_SNIFFER            → 找不到 sniffer 段，或 AUTOFALL 组缺失
+  · AUTOFALL_NOT_FALLBACK → AUTOFALL 不是 fallback 组，等于没有降级
+  · AUTOFALL_MEMBERS=...  → AUTOFALL 成员必须是 [PROXY, DIRECT] 且 DIRECT 在最后
+                            （顺序错了会变成永远直连：fallback 取第一个健康成员）
   enhanced-mode: redir-host 下，纯 IP 建连只能靠 sniffer 从 SNI/Host 还原域名，
   否则 DOMAIN 规则静默失效、流量落到 MATCH,DIRECT —— 表现为「代理不报错但没走代理」，
   而 IP 轮换只对走 PROXY 的流量有意义，那样等于空转。
-  诊断：grep -n -A14 '^sniffer:' $BASE/config.yaml"
+  诊断：grep -n -A14 '^sniffer:' $BASE/config.yaml ; grep -n -A10 'AUTOFALL' $BASE/config.yaml"
 fi
 
 # ==============================================================

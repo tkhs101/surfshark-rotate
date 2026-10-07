@@ -24,17 +24,22 @@
 ```
 VPS 整机流量
    │
-   ├─ opencode.ai / ip.sb ──→ TUN ──→ PROXY 组 ──→ WireGuard ──→ Surfshark JP/KR
-   │                                                          （每 5 分钟换一次出口 IP）
-   └─ 其他所有（含 SSH）───→ DIRECT ─────────────────→ 物理网卡
+   ├─ opencode.ai / ip.sb ──→ TUN ──→ AUTOFALL ──┬─（节点健康）→ PROXY 组 → WireGuard → Surfshark JP/KR
+   │                                             │                              （每 5 分钟换一次出口 IP）
+   │                                             └─（节点全挂）→ DIRECT ─────────→ 物理网卡
+   └─ 其他所有（含 SSH）───→ DIRECT ─────────────────────────────→ 物理网卡
 ```
 
-两个 systemd 单元：
+三个 systemd 单元：
 
 | 单元 | 作用 |
 |---|---|
 | `mihomo.service` | 内核常驻，`Restart=always` |
 | `surfshark-rotate.timer` | **那个 24 小时循环**，每 5 分钟触发一次 `surfshark-rotate.service` |
+| （降级时会临时起一个一次性单元） | 节点恢复后的复查，见[降级与恢复](#降级与恢复) |
+
+**AUTOFALL 是降级链**：节点全挂时 `opencode.ai` 会自动退到直连（还能用，只是出口变回本机），
+而不是直接连不上。没有它的话，私钥一过期整个项目就静默停摆。
 
 ---
 
@@ -124,6 +129,62 @@ bash /opt/surfshark-rotate/measure-nodes.sh                 # 重测节点延迟
 ```
 
 轮换间隔改 `surfshark-rotate.timer` 里的 `OnUnitActiveSec=5min`，然后 `systemctl daemon-reload`。
+
+---
+
+## 降级与恢复
+
+私钥到期、续费后换了新私钥、或者节点全挂时，**不要指望它报错**。没有 AUTOFALL 时
+opencode.ai 会直接连不上，日志里只有一行 `dial PROXY ... context deadline exceeded`。
+
+现在分两层处理：
+
+### 数据面：自动退到直连（内核层，无需人工）
+
+`AUTOFALL` 是 `fallback` 组，成员 `[PROXY, DIRECT]`，取第一个健康的：
+
+| 状态 | `AUTOFALL` 选中 | opencode.ai |
+|---|---|---|
+| 节点正常 | `PROXY` | 走 Surfshark 节点，IP 正常轮换 |
+| 节点全挂 | `DIRECT` | 走本机直连，**还能用**，但出口变回 VPS 自己的 IP |
+
+节点恢复后，mihomo 自己的健康检查会在下一个周期（≤60 秒）自动切回 `PROXY`。
+
+### 控制面：轮换自动停摆（脚本层）
+
+降级时继续轮换毫无意义，所以 `rotate.py` 会：
+
+1. 检测到 `AUTOFALL` 选中 `DIRECT`（或连续 2 轮取不到出口 IP）
+2. 记下降级状态，**停掉 `surfshark-rotate.timer`**
+3. 在日志里打出完整的恢复步骤
+
+所以看到 `surfshark-rotate.timer` 是 inactive 时，**先别当成故障** —— 看 `status.sh` 顶部有没有降级横幅。
+
+### 恢复
+
+换新私钥（`config.yaml` 里 `private-key`，4 处共用同一个）之后：
+
+```bash
+sudo systemctl restart mihomo
+```
+
+`mihomo.service` 的 `ExecStartPost` 钩子（`on-mihomo-up.sh`）会自动复查：
+节点已恢复就把 `surfshark-rotate.timer` 启回来并清掉降级标记。
+
+若 1 分钟内没自动恢复（`AUTOFALL` 的健康检查还没跑完），手工：
+
+```bash
+sudo systemctl start surfshark-rotate.timer
+```
+
+### 确认当前状态
+
+```bash
+sudo /opt/surfshark-rotate/status.sh      # 顶部横幅 + 分流验证
+```
+
+降级时横幅会直接写明「未走代理」和出口 IP。别看「代理出口 == 直连出口」就
+去查 `rules` —— 那是降级造成的，规则本身没问题。
 
 ---
 
