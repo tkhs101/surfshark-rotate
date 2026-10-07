@@ -65,6 +65,70 @@ dns:
     - 8.8.8.8
 
 # --------------------------------------------------------------
+#  sniffer：从 TLS SNI / HTTP Host / QUIC SNI 还原域名
+#
+#  【为什么必须开】本配置用 enhanced-mode: redir-host。该模式下 mihomo
+#  不保留「域名」这回事，应用最终是以 IP 建连的。DOMAIN-SUFFIX 这类规则
+#  要匹配，mihomo 唯一的依据是「自己此前处理过该域名的 DNS 查询」在内存里
+#  建立的 IP->域名映射。只要有一次解析绕开了 mihomo，域名规则就静默失效：
+#
+#    · 全新安装后系统 DNS 缓存里已有该域名的旧记录（TTL 未到）
+#    · 应用自带 DoH / DoT，绕开系统解析器
+#    · 应用长时间使用已缓存的 IP
+#    · systemd-resolved 还没把 mihomo 的 198.18.0.2 纳入 nameserver
+#    · 系统解析器落在 route-exclude-address 的排除网段里，DNS 根本不进 TUN
+#
+#  失败方向是「放行」而不是「拒绝」：没有任何报错，journalctl 里只有一行
+#  match Match using DIRECT，不主动去看根本发现不了。而本项目的 IP 轮换
+#  只对走 PROXY 的流量有意义 —— 分流一旦失效，轮换就是空转。
+#
+#  sniffer 直接从连接首包还原域名，不依赖 DNS 查询是否经过 mihomo，
+#  纯 IP 建连也能正确命中域名规则。
+#
+#  与 redir-host 不冲突，可以并存：这里不改 redir-host 的选择，
+#  只补上它缺失的那个前提条件。
+#
+#  实测（同一台机器、同一时刻，仅 sniffer 一项不同）：
+#    关闭：match Match using DIRECT                     ← 以纯 IP 匹配，落到兜底规则
+#    开启：match DomainSuffix(opencode.ai) using PROXY  ← 域名被还原，规则命中
+# --------------------------------------------------------------
+sniffer:
+  enable: true
+  sniff:
+    TLS:
+      ports: [443, 8443]
+    HTTP:
+      ports: [80, 8080-8880]
+    QUIC:
+      ports: [443, 8443]
+  # 纯 IP 建连（metadata.host 为空）时也嗅探。
+  # 【本项目的关键开关】没有这一项，上面 opencode.ai 那个场景不会生效。
+  parse-pure-ip: true
+  # 对「已经通过 redir-host 映射拿到域名」的连接也强制嗅探，以 SNI 为准。
+  # 覆盖的是另一类同源失效：映射存在却指向别的域名（CDN 共享 IP、映射过期）。
+  # 注意它不是「用 mihomo 的 DNS 重新解析」—— 那是 override-destination 的作用。
+  force-dns-mapping: true
+  # 嗅探到的域名只用于规则匹配，不用它改写实际访问的目标地址：
+  # mihomo 仍然去连客户端原本要连的那个 IP，分流语义与开启 sniffer 前完全一致。
+  # 必须显式写出来 —— 不写时它取 Go 零值 false 恰好是我们要的，但那是默认值
+  # 而不是契约；显式声明才不会因将来默认值变化而静默改变行为。
+  #（别写成 override-source，mihomo v1.19.32 没有这个键，会被静默忽略。）
+  override-destination: false
+  # 跳过这些域名的嗅探。本配置除 opencode.ai / ip.sb 外全部 MATCH,DIRECT，
+  # 所以这里对分流结果没有任何影响，纯粹是不做无用的解析。
+  # 一律用 "+." 后缀写法：mihomo 的 "*" 只匹配一级子域且不匹配裸域名，
+  # 写成 "*.msftconnecttest.com" 会漏掉 msftconnecttest.com 本身。
+  skip-domain:
+    - "+.internal"
+    - "google.internal"
+    - "localhost.ptlogin2.qq.com"
+    - "+.srv.nintendo.net"
+    - "+.stun.playstation.net"
+    - "+.xboxlive.com"
+    - "+.msftconnecttest.com"
+    - "+.msftncsi.com"
+
+# --------------------------------------------------------------
 #  节点（由 Surfshark 原生 WireGuard 配置转换，与 Windows 版逐字相同）
 # --------------------------------------------------------------
 proxies:

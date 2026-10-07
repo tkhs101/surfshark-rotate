@@ -251,6 +251,29 @@ if pub:
 else:
     notes.append("公网出口 IP 探测失败（可能还没出网）")
 
+# ---- 当前活跃 SSH 会话的对端 ----
+#
+# 【为什么必须加进排除列表】server 回给 client 的包，目的端口是 client 的
+# 随机临时端口，不是 22。所以 rules 里那条 DST-PORT,22,DIRECT 只在**出站方向**
+# 成立；回包方向靠的是「同一条连接已被判定为 DIRECT」这一连接跟踪结果，
+# 而不是规则本身。也就是说它并不是独立于内核进程的第二道保险：
+# mihomo 一旦停掉或崩了，内核里残留的 TUN 路由仍在，SSH 回包会被吞掉。
+#
+# 写进 route-exclude-address 之后，内核在路由阶段就绕开 TUN，
+# 完全不经过 mihomo 的任何代码 —— 与本机地址、元数据网段享受同等级的保证。
+# 本方案的设计原则是「宁可装失败，也不能把自己锁在服务器外面」，
+# 而 SSH 恰恰是最不能出问题的那条连接。
+#
+# 注意 ss 的列序会随过滤器而变：
+#   ss -tn                                   → State Recv-Q Send-Q Local Peer  （对端 = 第 5 列）
+#   ss -tn state established '( sport = :22 )' →       Recv-Q Send-Q Local Peer  （对端 = 第 4 列）
+# 带 state 过滤器时 ss 会省掉 State 列。用无过滤器的列序去取对端会拿到本机地址，
+# 等于什么都没加 —— 这里两种写法都实测过，按带过滤器的 4 列来取。
+for line in run("ss", "-tn", "state", "established", "( sport = :22 )").splitlines()[1:]:
+    parts = line.split()
+    if len(parts) >= 4:
+        add(parts[3].rsplit(":", 1)[0])
+
 # 云厂商元数据地址：被 TUN 劫持会导致取不到实例凭据
 CIDRS = [
     "169.254.0.0/16",       # AWS / GCP / Azure
@@ -407,10 +430,109 @@ c_ok "  ✓ 代理出口 IP：$PROXY_IP"
 
 DIRECT_IP="$(curl -fsS --max-time 15 https://api.ipify.org 2>/dev/null | tr -d '[:space:]' || echo '(取不到)')"
 c_ok "  直连出口 IP：$DIRECT_IP"
-if [ "$DIRECT_IP" != "$PROXY_IP" ] && [ "$DIRECT_IP" != "(取不到)" ]; then
-    c_ok "  ✓ 分流生效：opencode.ai 走代理，其余直连"
+if [ "$DIRECT_IP" = "$PROXY_IP" ]; then
+    c_warn "  ⚠ 直连与代理出口 IP 相同，代理通路可能整体失效"
+fi
+
+# ---- 真正验证「opencode.ai 命中域名规则并走了代理」----
+#
+# 只对比直连出口与代理出口是否不同，是不够的：那只证明了代理通路本身可用。
+# 即使 opencode.ai 100% 直连，那一步也会打印「✓ 分流生效」——
+# 本项目最核心的目的（opencode.ai 走代理，IP 轮换才有意义）一次都没被验证过。
+# 这正是「分流静默失效却一路绿灯装完」的原因。
+#
+# 改为发起真实请求的同时轮询 /connections，看是否存在
+#   host 以 opencode.ai 结尾、且 chains 含 PROXY/FAST 的条目。
+# /connections 是瞬时快照，单次查询极易错过，因此用「后台请求 + 短轮询」。
+IPS="$(getent ahostsv4 opencode.ai 2>/dev/null | awk '{print $1}' | sort -u | tr '\n' ' ' || true)"
+HIT=""
+for _try in $(seq 1 8); do
+    curl -fs --max-time 10 -o /dev/null https://opencode.ai/ >/dev/null 2>&1 &
+    _cpid=$!
+    for _ in $(seq 1 25); do
+        HIT="$("$PY3" - "$SECRET" "$IPS" <<'PY'
+import json, sys, urllib.request
+sec, ips = sys.argv[1], set(sys.argv[2].split())
+req = urllib.request.Request("http://127.0.0.1:9097/connections",
+                             headers={"Authorization": "Bearer " + sec})
+try:
+    data = json.load(urllib.request.urlopen(req, timeout=3))
+except Exception:
+    sys.exit(0)
+for c in data.get("connections") or []:
+    md = c.get("metadata") or {}
+    host, dip = md.get("host") or "", md.get("destinationIP") or ""
+    chains = c.get("chains") or []
+    if host.endswith("opencode.ai"):
+        print("PROXY" if any(x in ("PROXY", "FAST") for x in chains) else "DIRECT")
+        break
+    # host 为空且目标 IP 属于 opencode.ai = 以纯 IP 建连且规则没命中（被绕过）
+    if not host and dip in ips:
+        print("BYPASS")
+        break
+PY
+)"
+        [ -n "$HIT" ] && break
+        sleep 0.1
+    done
+    # curl 失败是正常的（站点可能返回非 2xx），与本检查无关。
+    # 不加 || true 的话 set -e 会在 curl 非 0 退出时直接中止整个安装。
+    wait "$_cpid" 2>/dev/null || true
+    [ -n "$HIT" ] && break
+done
+
+case "$HIT" in
+    PROXY)
+        c_ok "  ✓ 分流生效：opencode.ai 已命中域名规则并走代理"
+        ;;
+    DIRECT|BYPASS)
+        die "opencode.ai 未走代理（判定=$HIT），域名规则没有生效。
+  典型原因：应用解析绕开了 mihomo（DNS 缓存命中 / 自带 DoH、DoT /
+  系统解析器落在 route-exclude-address 的排除网段内），内核内存里没有
+  该域名的 IP->域名映射，纯 IP 建连直接落到 MATCH,DIRECT 静默直连。
+  确认 config.yaml 的 sniffer 段已启用，且 parse-pure-ip: true。
+  已启动的 mihomo 仍可手工修好：改完 config.yaml 后 systemctl restart mihomo"
+        ;;
+    *)
+        die "未能观测到 opencode.ai 的连接，无法确认分流是否生效。
+  排查：curl -v --max-time 15 https://opencode.ai/ 看是否连通；
+        journalctl -u mihomo -n 50 --no-pager | grep -i opencode"
+        ;;
+esac
+
+# ---- 能力校验：纯 IP 建连能不能命中域名规则 ----
+#
+# 上面的运行时检查证明的是「此刻 opencode.ai 走的是代理」，但它证明不了
+# 「纯 IP 建连也能命中域名规则」。这两件事不等价，实测过：
+# 把 sniffer 关掉后重跑同一个检查，它照样返回 PROXY ——
+# 因为它自己那条 curl 会做一次正常 DNS 解析，该查询经 dns-hijack 进了
+# mihomo，重新建立了 IP->域名映射，于是规则又命中了。
+# 也就是说「sniffer 根本没生效」这个故障可以完全躲过运行时检查。
+#
+# 所以这里再补一个确定性的能力校验：直接检查刚生成、且已通过 mihomo -t
+# 语法检查的 config.yaml 里 sniffer 段是否真的开着。config.yaml 是本脚本
+# 从同目录的 config.yaml 生成的，不存在「用户手改了一份另一套」的可能。
+SNIFF="$("$PY3" - "$BASE/config.yaml" <<'PY'
+import re, sys, pathlib
+t = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+m = re.search(r'(?ms)^sniffer:[ \t]*\n((?:[ \t]+.*\n|[ \t]*\n)*)', t)
+if not m:
+    print("NO_SNIFFER"); raise SystemExit
+blk = m.group(1)
+def flag(name):
+    r = re.search(r'(?m)^[ \t]+' + name + r':[ \t]*(\S+)', blk)
+    return r.group(1).strip('"\'') if r else None
+print("OK" if flag("enable") == "true" and flag("parse-pure-ip") == "true" else "WEAK")
+PY
+)"
+if [ "$SNIFF" = "OK" ]; then
+    c_ok "  ✓ 域名嗅探能力已启用（纯 IP 建连也能命中 DOMAIN 规则）"
 else
-    c_warn "  ⚠ 两个出口 IP 相同，分流可能没生效，请检查规则"
+    die "config.yaml 的 sniffer 段未正确启用（判定=$SNIFF）。
+  enhanced-mode: redir-host 下，纯 IP 建连只能靠 sniffer 从 SNI/Host 还原域名，
+  否则 DOMAIN 规则静默失效、流量落到 MATCH,DIRECT —— 表现为「代理不报错但没走代理」，
+  而 IP 轮换只对走 PROXY 的流量有意义，那样等于空转。
+  诊断：grep -n -A14 '^sniffer:' $BASE/config.yaml"
 fi
 
 # ==============================================================
