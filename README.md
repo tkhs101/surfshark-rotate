@@ -39,8 +39,10 @@ VPS 整机流量
 | `surfshark-rotate.timer` | **那个 24 小时循环**，每 5 分钟触发一次 `surfshark-rotate.service` |
 | （降级时会临时起一个一次性单元） | 节点恢复后的复查，见[降级与恢复](#降级与恢复) |
 
-**AUTOFALL 是降级链**：节点全挂时 `opencode.ai` 会自动退到直连（还能用，只是出口变回本机），
+**AUTOFALL 是降级链**：节点不可用时 `opencode.ai` 会退到直连（还能用，只是出口变回本机），
 而不是直接连不上。没有它的话，私钥一过期整个项目就静默停摆。
+它是一个 `select` 组，由 `rotate.py` 显式切换 —— 详见[降级与恢复](#降级与恢复)
+与 [ADR 0001](docs/adr/0001-degradation-owner.md)。
 
 ---
 
@@ -162,15 +164,26 @@ opencode.ai 会直接连不上，日志里只有一行 `dial PROXY ... context d
 `max-failed-times` 只作用于 `onDialFailed`（拨号失败路径），周期健康检查不走它；
 `fixed` 钉选成员仍被存活检查覆盖；`relay` 已移除；`fallback-filter` 是 DNS 字段。
 
-`select` 组没有健康检查，**永不自行翻转**。降级只在**连续 2 轮取不到出口 IP**
-（约 10 分钟）时触发 —— 要求故障持续至少一个完整轮换周期：私钥到期会持续数天，
-必然满足；瞬时抖动不会。
+`select` 组没有健康检查，**永不自行翻转**。降级需要**两个独立信号同时成立**：
+
+1. 连续 2 轮取不到出口 `IP`（约 10 分钟）—— 要求故障持续至少一个完整轮换周期
+2. 控制面 `/proxies/<节点>/delay` 也探测不到节点
+
+第 2 条不可省。只看第 1 条会把「ip.sb 限流或宕机」误判成「隧道坏了」，
+从而把一条**完全健康**的隧道切到直连 —— 那就成了一个新的泄漏源，而且比内核
+那次瞬时翻转更糟（那个 <1 秒，这个是两整轮、期间所有连接都算）。
+
+### 一个必须知道的失效方向
+
+脚本是降级的**唯一**决策方，所以 rotate.py 本身坏掉时不会降级（fail-closed）。
+方向上比泄漏安全，但代价是 opencode.ai 会一直连不上而不出现降级横幅。
+这种情况由 `status.sh` 的 `ExecMainStatus` 标红，以及 `rotate.py --status` 暴露。
 
 ### 控制面：轮换自动停摆（脚本层）
 
 降级时继续轮换毫无意义，所以 `rotate.py` 会：
 
-1. 连续 2 轮取不到出口 IP
+1. 连续 2 轮取不到出口 IP，且控制面也探测不到节点
 2. 把 `AUTOFALL` 切到 `DIRECT`、记下降级状态、**停掉 `surfshark-rotate.timer`**
 3. 在日志里打出完整的恢复步骤
 
@@ -187,15 +200,23 @@ sudo systemctl restart mihomo
 `mihomo.service` 的 `ExecStartPost` 钩子（`on-mihomo-up.sh`）会自动复查。
 判据是**控制面的 `/proxies/<节点>/delay`** —— 节点本身现在通不通，
 完全不经过 `AUTOFALL` 与数据面（降级时 `AUTOFALL` 是我们**自己**设成 `DIRECT` 的，
-拿它判断恢复会自证循环）。确认恢复后钩子把 `AUTOFALL` 切回 `PROXY`、
-启回定时器并清掉降级标记。
+拿它判断恢复会自证循环）。要求**连续 2 次健康**才判定恢复，与降级侧的迟滞对称：
+单次侥幸成功不足以证明修好了，探测对象是 `cp.cloudflare.com`，不是我们要保的出口。
 
-若节点此刻还没活，钩子会起一个一次性复查（`systemd-run --on-active=90`，
-平时根本不存在这个东西）；仍没恢复就手工：
+确认恢复后钩子把 `AUTOFALL` 切回 `PROXY`、启回定时器并清掉降级标记。
+提示语由切换的真实结果决定 —— 切不回去时会明确说「可能仍在直连」并给出确认命令。
+
+若节点此刻还没活，钩子会起一次复查（`systemd-run --on-active=90`），
+**最多 6 次**（约 9 分钟）。超限后明确交给你，并说明重启即可重新计数：
 
 ```bash
+sudo systemctl restart mihomo      # 重新自动复查
+# 或直接
 sudo systemctl start surfshark-rotate.timer
 ```
+
+> 另有一条恢复路径：不重启 mihomo、手工跑一轮 `rotate.py`。钩子不在这条路径上，
+> 所以 `clear_degraded()` 会主动把定时器启回来。
 
 ### 确认当前状态
 

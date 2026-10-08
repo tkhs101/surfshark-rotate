@@ -29,9 +29,13 @@ STATE="$BASE/.rotate_state.json"
 TIMER="surfshark-rotate.timer"
 PY3="$(command -v python3 || true)"
 
-# 二次复查的延迟（秒）。要给 mihomo 的健康检查留出至少一个 interval，
-# 否则节点可能刚好还没被判定为恢复。
+# 复查的间隔与上限。
+# 间隔：换新私钥 + restart mihomo 之后，WireGuard 要重新握手，给它一点时间。
+# 上限：复查是有限次的。早先这里每 90 秒无条件重排自己一次，只要没人修私钥
+# 就永远存在，既持续写 journal，也和本脚本「正常运行时立刻返回」的说明矛盾。
+# 超限后明确交给人，并说明重启即可重新计数。
 RECHECK_DELAY=90
+RECHECK_MAX=6      # 6 × 90s ≈ 9 分钟
 
 say() { printf '[on-mihomo-up] %s\n' "$*"; }
 
@@ -50,15 +54,24 @@ say() { printf '[on-mihomo-up] %s\n' "$*"; }
 # 而定时器早就被 mark_degraded 停掉了 —— 谁都不会再去看它一眼。
 # 早先这里直接 exit 0，等于让这种状态永久泄漏且无人察觉。
 # 所以读不出状态时继续往下走，改用数据面本身（AUTOFALL 实际指向谁）来判断。
+# 三态判定，用 case 写而不是 && / || —— 退出码的语义必须一眼可见：
+#   0 = 明确处于降级态 -> 继续往下走
+#   1 = 明确没有在降级 -> 立刻返回（正常启动走的就是这条，零开销）
+#   2 = 状态文件读不出来 -> 继续往下走，改用数据面判断
+# 早先写成 `"$PY3" -c ... && exit 0`，把语义整个反转了：已降级反而立刻退出，
+# 于是恢复路径完全失灵 —— 而降级路径不受影响，只测降级根本发现不了。
 STATE_UNKNOWN=0
 if [ -f "$STATE" ]; then
     "$PY3" -c 'import json,sys
 try:
     sys.exit(0 if json.load(open(sys.argv[1])).get("degraded") else 1)
 except Exception:
-    sys.exit(2)' "$STATE" 2>/dev/null && exit 0
-    rc=$?
-    [ "$rc" = "2" ] && STATE_UNKNOWN=1
+    sys.exit(2)' "$STATE" 2>/dev/null
+    case "$?" in
+        0) ;;
+        1) exit 0 ;;
+        *) STATE_UNKNOWN=1 ;;
+    esac
 else
     STATE_UNKNOWN=1
 fi
@@ -95,14 +108,22 @@ done
 # 它回答的是一个独立问题：节点本身现在通不通。
 #
 # 输出 "<当前节点> <延迟毫秒>" 表示活着；输出空串表示还没活。
-RESULT="$("$PY3" - <<'PY' 2>/dev/null
-import json, re, sys, urllib.parse, urllib.request
+#
+# 连续采样 HEALTH_PROBES 次（中间隔 HEALTH_GAP 秒），全健康才算恢复 ——
+# 与 rotate.py 的 RECOVER_AFTER_HEALTHY 对称。单次侥幸成功不足以证明
+# 「真的修好了」：那次成功的对象是 cp.cloudflare.com，不是我们要保的出口。
+# 两次之间任何一个失败就整体作废，避免对着一台还在抖的隧道下结论。
+HEALTH_PROBES=2
+HEALTH_GAP=8
+RESULT="$("$PY3" - "$HEALTH_PROBES" "$HEALTH_GAP" <<'PY' 2>/dev/null
+import json, re, sys, time, urllib.parse, urllib.request
 cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
 sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
 if not sec:
     sys.exit(0)
 H = {"Authorization": "Bearer " + sec.group(1)}
 API = "http://127.0.0.1:9097"
+WANT = int(sys.argv[1]); GAP = int(sys.argv[2])
 
 
 def get(path, timeout=15):
@@ -110,16 +131,29 @@ def get(path, timeout=15):
     return json.load(urllib.request.urlopen(req, timeout=timeout))
 
 
+def probe(node):
+    q = urllib.parse.quote(node, safe="")
+    u = urllib.parse.quote("http://cp.cloudflare.com/", safe="")
+    try:
+        d = get("/proxies/%s/delay?timeout=8000&url=%s" % (q, u), timeout=20)
+        dl = d.get("delay")
+        return dl if isinstance(dl, int) and dl > 0 else None
+    except Exception:
+        return None
+
+
 try:
     node = get("/proxies/PROXY").get("now") or ""
     if not node:
         sys.exit(0)
-    q = urllib.parse.quote(node, safe="")
-    u = urllib.parse.quote("http://cp.cloudflare.com/", safe="")
-    d = get("/proxies/%s/delay?timeout=8000&url=%s" % (q, u), timeout=20)
-    delay = d.get("delay")
-    if isinstance(delay, int) and delay > 0:
-        print("%s %d" % (node, delay))
+    last = None
+    for i in range(WANT):
+        if i:
+            time.sleep(GAP)
+        last = probe(node)
+        if last is None:
+            sys.exit(0)          # 任一次失败 -> 整体作废
+    print("%s %d" % (node, last))
 except Exception:
     pass
 PY
@@ -129,14 +163,45 @@ NODE_ALIVE="${RESULT%% *}"
 DELAY_MS="${RESULT##* }"
 
 if [ -z "$NODE_ALIVE" ]; then
-    # 节点此刻确实还没活。起一个一次性复查：到点再判断一次，成功就启回定时器。
-    # 用 systemd-run 而不是常驻 timer —— 平时根本不存在这个东西。
-    say "控制面探测节点失败，${RECHECK_DELAY}s 后复查一次"
+    # 节点此刻还没活，起一次复查。
+    #
+    # 【复查次数必须有上限】早先这里每 90 秒无条件重排自己一次，只要没人去修
+    # 私钥就永远存在：既持续往 journal 里写，也和本脚本开头「正常运行时立刻
+    # 返回、零开销」的说法自相矛盾。计数存在状态文件里，所以走的是 rotate.py
+    # 的原子写，不会和轮换那一侧撞车。
+    #
+    # 上限的意义不是「等够了就放弃」，而是把等待变成有限次的、看得见的等待 ——
+    # 超限时明确告诉人现在是什么状态、要做什么，而不是让人以为系统还在自己
+    # 努力。再往后想恢复，只需要 restart mihomo 一次，计数会重置。
+    TRIES="$("$PY3" -c '
+import json, sys, os
+p = sys.argv[1]
+try:
+    print(int(json.load(open(p)).get("recheck_tries") or 0))
+except Exception:
+    print(0)' "$STATE" 2>/dev/null || echo 0)"
+    NEXT=$((TRIES + 1))
+
+    if [ "$NEXT" -gt "$RECHECK_MAX" ]; then
+        say "已复查 $TRIES 次仍未恢复，停止自动复查（不会有人来修的）"
+        say "  现在是降级态：opencode.ai 走直连还能用，但出口是本机 IP，轮换已停摆。"
+        say "  修好之后二选一：sudo systemctl restart mihomo（计数重置，重新自动复查）"
+        say "            或直接 sudo systemctl start $TIMER"
+        exit 0
+    fi
+
+    say "控制面探测节点失败，${RECHECK_DELAY}s 后复查（第 $NEXT/$RECHECK_MAX 次）"
+    # 计数由 rotate.py 落盘：它走 flock + 原子写，是状态 schema 的唯一 owner。
+    # 钩子里再手写一份读-改-写，就多一个能把它写坏的版本 —— 实测手写那份
+    # 确实没写进去，而计数没落盘会让上限永远不生效。
+    GOT="$("$PY3" "$BASE/rotate.py" --recheck-tried 2>/dev/null || echo "$NEXT")"
+    [ "$GOT" = "$NEXT" ] || say "⚠ 复查计数写入异常（期望 $NEXT，实得 $GOT）"
+
     if command -v systemd-run >/dev/null; then
         systemd-run --quiet --unit=surfshark-rotate-resume \
             --on-active="${RECHECK_DELAY}" \
             /bin/bash "$BASE/on-mihomo-up.sh" >/dev/null 2>&1 \
-            || say "一次性复查起不来，等下次 mihomo 重启或手工 systemctl start $TIMER"
+            || say "复查起不来，等下次 mihomo 重启或手工 systemctl start $TIMER"
     else
         say "systemd-run 不可用，请手工执行 systemctl start $TIMER"
     fi
@@ -145,33 +210,39 @@ fi
 
 # ---- 已恢复：切回代理、启回定时器并清标记 ----
 if systemctl start "$TIMER" 2>/dev/null; then
-    "$PY3" -c 'import json,sys
-p = sys.argv[1]
-try:
-    d = json.load(open(p))
-    for k in ("degraded", "degraded_reason", "degraded_at", "fail_streak", "direct_seen"):
-        d.pop(k, None)
-    d["fail_streak"] = 0
-    json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)
-except Exception:
-    pass' "$STATE" 2>/dev/null
+    # 降级痕迹交给 rotate.py 清，不在这里再写一份 key 列表 ——
+    # 两个写入方各维护一份清单，迟早会漏掉某个键，而漏掉的恰恰是
+    # 「标记已恢复」这类语义最重的键。顺带把复查计数一并归零。
+    "$PY3" "$BASE/rotate.py" --clear-degraded >/dev/null 2>&1
+
     # 顺手把 AUTOFALL 切回 PROXY。降级时是我们自己把它设成 DIRECT 的，
     # 光清状态不够 —— 否则要等到下一轮轮换（最多 5 分钟）才纠正回来，
     # 这段时间 opencode.ai 仍在用本机 IP 出网，正是这个项目要避免的事。
-    "$PY3" - <<'PYHOOK' 2>/dev/null
+    #
+    # 提示语必须由这一步的真实结果决定：说「已切回」而实际没切成，
+    # 是整个系统里最不该发生的一类误导 —— 它会让运维以为泄漏已经堵上了。
+    if "$PY3" - <<'PYHOOK' 2>/dev/null
 import json, re, sys, urllib.request
 cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
 sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
-if sec:
-    req = urllib.request.Request(
-        "http://127.0.0.1:9097/proxies/AUTOFALL",
-        method="PUT", data=json.dumps({"name": "PROXY"}).encode(),
-        headers={"Authorization": "Bearer " + sec.group(1),
-                 "Content-Type": "application/json"})
-    urllib.request.urlopen(req, timeout=10).read()
+if not sec:
+    sys.exit(1)
+req = urllib.request.Request(
+    "http://127.0.0.1:9097/proxies/AUTOFALL",
+    method="PUT", data=json.dumps({"name": "PROXY"}).encode(),
+    headers={"Authorization": "Bearer " + sec.group(1),
+             "Content-Type": "application/json"})
+urllib.request.urlopen(req, timeout=10).read()
+sys.exit(0)
 PYHOOK
-    say "节点已恢复（$NODE_ALIVE 延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
-    say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
+    then
+        say "节点已恢复（$NODE_ALIVE 连续 2 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+        say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
+    else
+        say "节点已恢复（$NODE_ALIVE 连续 2 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+        say "⚠ AUTOFALL 未能切回 PROXY —— opencode.ai 可能仍在直连，请手工确认："
+        say "  sudo python3 $BASE/rotate.py --status"
+    fi
 else
     say "启用 $TIMER 失败，请手工执行：systemctl start $TIMER"
 fi
