@@ -90,6 +90,31 @@ v1.19.32）：17 小时内内核自行翻转到 `DIRECT` 共 5 次，其中一�
   因为物化点会不断挪到下一个调用方，必须从策略上关掉。
 
 
+## 测试夹具与真机的字段一致性（第六轮自查）
+
+`BROAD` 集合曾经写成 config.yaml 的 YAML 拼写，而 mihomo 的 `/rules` 返回的是
+CamelCase —— 13 条里 8 条是死的，而测试夹具也用了同样的错拼写，于是全绿。
+「替身比真实契约宽松」由此在**上一层**复发：我们从「替换 api()」进化到了
+「真起 HTTP 服务」，但伪造的 payload 形状仍然是猜的。
+
+因此专门核了一遍：本项目代码实际读取的字段，与真机返回的是否一致。
+
+  · `/connections` 的 metadata：代码读 `host` / `sniffHost` / `destinationIP`
+    —— 三个都真实存在。真机另有 22 个字段（`destinationGeoIP`、`sourceIPASN`、
+    `dnsMode`、`specialRules`…）未用。
+  · 顶层：代码读 `chains` / `metadata` —— 都存在。
+  · `/proxies` 的组：代码读 `all` / `type` —— 真机返回
+    `Selector` / `['PROXY','DIRECT']`，与夹具一致。
+  · `/rules`：已按真机改为 CamelCase。
+
+**漏掉的更强信号**：真机的 `/connections` 每条连接带 `rule` 与 `rulePayload`，
+直接告诉你「命中了哪条规则」。一条 opencode.ai 的连接若 `rule == 'Match'`，
+就是确定落进了 `MATCH,DIRECT` —— 比 `chains[0]=='DIRECT'` 更直接，而且能区分
+两种泄漏原因（sniffer 失效 vs 配置被改坏），排查方向不同。
+本轮未采用：它仍需先判定该连接属于 opencode.ai，而那一步依赖域名或 IP，
+与现有判据是同一个约束。留作后续。
+
+
 ## 核对点为什么前移，以及它换来了什么代价
 
 分流核对放在**切节点与热重载之前**，规则确认违规就 `raise SystemExit(3)`，
