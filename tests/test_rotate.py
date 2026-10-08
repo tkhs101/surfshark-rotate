@@ -986,8 +986,10 @@ class TestLeakIpTtl(RotateTestBase):
                 self.rotate._leak_ips()
         finally:
             _s.getaddrinfo = real
-        self.assertEqual(len(calls), 1,
-                         "持续失败时每轮重试 DNS —— TTL 对失败路径失效了")
+        # 一次 _leak_ips 调用会按 AF_INET / AF_INET6 各试一次，所以是 2 次；
+        # 4 次调用若每次都重试就会是 8 次。关键是「不随调用次数增长」。
+        self.assertLessEqual(len(calls), 2,
+                             "持续失败时每轮重试 DNS —— TTL 对失败路径失效了")
 
     def test_keeps_previous_good_cache_on_failure(self):
         import socket as _s
