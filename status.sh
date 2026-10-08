@@ -210,7 +210,16 @@ elif [ "$DIRECT" = "$PROXY" ]; then
         c_warn "  排查：journalctl -u mihomo -n 40 | grep -i opencode"
     fi
 else
-    c_ok "  分流正常：只有 opencode.ai / ip.sb 走代理"
+    # 【这条绿字只断言了 ip.sb】上面两次探测走的是 ip.sb（域名型 socks5h），
+    # 所以它证明的只有「ip.sb 经代理出去」。
+    # 早先这里写的是「分流正常：只有 opencode.ai / ip.sb 走代理」——
+    # **顺带断言了它没验证过的东西**，而 sniffer 失效（域名没被还原、
+    # 纯 IP 建连落进 MATCH,DIRECT）恰好**不改变** ip.sb 的结果，
+    # 因为 ip.sb 走的是域名型代理。于是这正是 L3 类泄漏下的「假全绿」：
+    # opencode.ai 正在直连，而这一行是绿的。
+    # opencode.ai 那一路现在由上面的「泄漏检测」单独断言（阳性检测）。
+    c_ok "  分流正常：ip.sb 经代理出去（这是本段唯一验证过的那一路）"
+    c_warn "  提醒：本段不验证 opencode.ai —— 它走上面的阳性检测（connections 的 chains）"
 fi
 
 line "泄漏检测"

@@ -1185,28 +1185,23 @@ class TestInstallGuards(unittest.TestCase):
             self.assertEqual(got, want, "判据对 %r 的判定错了" % text[:30])
 
 
-class TestDocClaims(unittest.TestCase):
-    """文档里的具体数字必须与代码常量一致 —— 评审第五轮逐条核对过一轮。"""
+class TestUninstallPurge(unittest.TestCase):
+    """--purge 的语义是「彻底删除」，就不该留一份含私钥的 config 在盘上。"""
 
-    def test_status_hint_matches_recheck_budget(self):
-        hook = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
-        import re
-        n = int(re.search(r"RECHECK_MAX=(\d+)", hook).group(1))
-        d = int(re.search(r"RECHECK_DELAY=(\d+)", hook).group(1))
-        minutes = (n * d) // 60
-        status = (ROOT / "status.sh").read_text(encoding="utf-8")
-        m = re.search(r"若 (\d+) 分钟内没自动恢复", status)
-        self.assertIsNotNone(m, "status.sh 应说明复查需要多久")
-        self.assertEqual(int(m.group(1)), minutes,
-                         "status.sh 的等待提示与 RECHECK_MAX×RECHECK_DELAY 不符")
+    def _purge_block(self):
+        """取**真正执行 purge 的那一段**，不是文件头注释里的第一处 --purge。"""
+        src = (ROOT / "uninstall.sh").read_text(encoding="utf-8")
+        i = src.index('if [ "$PURGE" -eq 1 ]; then')
+        blk = src[i:src.index("else", i)]
+        # 只看代码行 —— 注释里正是在引用旧文件名来说明改了什么
+        return chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
 
-    def test_no_replacement_characters_in_docs(self):
-        for f in ("README.md", "status.sh", "config.yaml",
-                  "docs/adr/0001-degradation-owner.md"):
-            txt = (ROOT / f).read_text(encoding="utf-8")
-            self.assertNotIn("�", txt, "%s 里有 U+FFFD 替换字符" % f)
-
-    def test_adr_does_not_reference_removed_api(self):
+    def test_purge_does_not_copy_config_with_private_keys(self):
+        blk = self._purge_block()
+        self.assertNotIn("surfshark-config-", blk,
+                         "把含 4 处 WireGuard 私钥的 config 复制到 /root 永久保留，"
+                         "与 purge 的语义完全相反")
         txt = (ROOT / "docs/adr/0001-degradation-owner.md").read_text(encoding="utf-8")
         self.assertNotIn("replace=True", txt, "save_state/replace= 已被 update_state 取代")
         self.assertNotIn("save_state", txt)

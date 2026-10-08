@@ -43,9 +43,19 @@ c_ok "  ✓ 单元已移除"
 
 step "4/4  处理安装目录"
 if [ "$PURGE" -eq 1 ]; then
+    # 【--purge 是「彻底删除」，就不该留一份密钥在盘上】
+    # 早先这里把 config.yaml 复制到 /root/surfshark-config-<日期>.yaml
+    # 「以防万一」—— 而那个文件里有 4 处 Surfshark WireGuard 私钥，
+    # 与 purge 的语义完全相反，且没有任何提示。
+    # 备份是**默认**路径（不 purge）就已经在做的事；真要彻底删就别留。
     if [ -f "$BASE/config.yaml" ]; then
-        cp -a "$BASE/config.yaml" "/root/surfshark-config-$(date +%Y%m%d-%H%M%S).yaml"
-        c_ok "  配置已备份到 /root/"
+        c_warn "  注意：config.yaml 里有 Surfshark 私钥，--purge 将**不保留**备份。"
+        printf '  确实要删？输入 PURGE 确认（其它任意键取消）：'
+        read -r _ans
+        if [ "$_ans" != "PURGE" ]; then
+            c_err "  已取消。$BASE 保留，可重新运行本脚本不带 --purge。"
+            exit 1
+        fi
     fi
     rm -rf "$BASE"
     c_ok "  ✓ $BASE 已删除"
