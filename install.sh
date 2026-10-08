@@ -651,6 +651,21 @@ step "8/9  验证轮换器能通过 API 认证"
 # 放在启用定时器之前，避免把「每 5 分钟失败一次」留在机器上。
 VERIFY_OUT="$("$PY3" "$BASE/rotate.py" --dry-run 2>&1 || true)"
 printf '%s\n' "$VERIFY_OUT" | sed 's/^/  /'
+# 「轮换开始」这行是在分流核对**之前**打印的，所以只 grep 它的话，
+# 分流规则已经指向 DIRECT（= 正在泄漏）也会照样显示绿色的「认证正常」。
+# 安装输出里同时出现泄漏告警和成功绿字，比不报更糟。
+if printf '%s\n' "$VERIFY_OUT" | grep -q '轮换开始' &&
+   printf '%s\n' "$VERIFY_OUT" | grep -q '分流规则异常'; then
+    die "分流规则异常：mihomo 已加载的规则与本配置不符，opencode.ai 会走直连
+  并把本机 IP 泄漏出去。上方输出里有具体是哪一条不符。
+  权威来源是 mihomo 实际加载的规则，不是磁盘上的 config.yaml：
+    sudo curl -s -H 'Authorization: Bearer <secret>' http://127.0.0.1:9097/rules"
+fi
+if printf '%s\n' "$VERIFY_OUT" | grep -q '轮换开始' &&
+   printf '%s\n' "$VERIFY_OUT" | grep -q '无法核对'; then
+    c_warn "  ⚠ 分流规则这一轮无法核对（既没有泄漏证据，也没有「规则正常」的证据）"
+    c_warn "    轮换器本身认证正常；建议装完后手工核对 /rules"
+fi
 if printf '%s\n' "$VERIFY_OUT" | grep -q '轮换开始'; then
     c_ok "  ✓ 轮换器认证正常"
 else

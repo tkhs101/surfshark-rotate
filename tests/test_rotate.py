@@ -656,7 +656,7 @@ class TestInvariantBypasses(RotateTestBase):
         """加一条 GEOSITE,opencode,DIRECT 排在前面就能完全遮蔽。"""
         self.seed()
         FakeMihomo.rules = [
-            {"type": "GEOSITE", "payload": "opencode", "proxy": "DIRECT"},
+            {"type": "GeoSite", "payload": "opencode", "proxy": "DIRECT"},
             {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
             {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
         ]
@@ -664,10 +664,66 @@ class TestInvariantBypasses(RotateTestBase):
         self.assertEqual(verdict, "VIOLATION", "遮蔽必须被发现")
         self.assertTrue(any("遮蔽" in m for m in problems), problems)
 
+    def test_domain_suffix_ai_shadowing_is_caught(self):
+        """最可能被人手写出来的遮蔽：DOMAIN-SUFFIX,ai,DIRECT。
+
+        早先 BROAD 写的是 YAML 拼写，DomainSuffix.upper() 之后是 DOMAINSUFFIX
+        而不是 DOMAIN-SUFFIX，于是**这一条原本是漏检的**，而测试夹具当时也用了
+        同样的错拼写，所以一路绿灯。
+        """
+        self.seed()
+        FakeMihomo.rules = [
+            {"type": "DomainSuffix", "payload": "ai", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION",
+                         "DOMAIN-SUFFIX,ai,DIRECT 是最现实的遮蔽，必须能抓到")
+        self.assertTrue(any("遮蔽" in m for m in problems), problems)
+
+    def test_in_type_direct_is_not_a_false_shadow(self):
+        """IN-TYPE,HTTP,DIRECT 合法且无害，不该被报成遮蔽。
+
+        报成遮蔽 -> VIOLATION -> 退出码 3 -> 轮换停摆 + 谎报泄漏。
+        一个假的 VIOLATION 代价不比真的小。
+        """
+        self.seed()
+        FakeMihomo.rules = [
+            {"type": "InType", "payload": "HTTP", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "OK", "误报会停掉唯一产出并谎报泄漏：%s" % problems)
+
+    def test_broad_set_uses_mihomo_spelling_not_yaml(self):
+        """BROAD 字面量里必须是 /rules 的 Type，不是 config.yaml 的写法。
+
+        只查 BROAD 那个字面量，不扫整个文件 —— 注释里正是在解释这个坑，
+        把说明文字当成违规会把这条测试自己搞坏。
+
+        契约来自真机实测：/rules 的 type 取值是 DomainSuffix / DstPort / Match。
+        """
+        import rotate as _r
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("BROAD = {")
+        j = src.index("}", i)
+        broad = src[i:j]
+        # GEOSITE / GEOIP 是**对的**：mihomo 返回 GeoSite / GeoIP，
+        # .upper() 正好对上。真正死掉的只有带连字符的那几个。
+        for bad in ('"IP-CIDR"', '"DOMAIN-SUFFIX"', '"DOMAIN-KEYWORD"',
+                    '"DOMAIN-REGEX"', '"RULE-SET"', '"IP-CIDR6"',
+                    '"IN-TYPE"', '"PROCESS-NAME"', '"IN-NAME"'):
+            self.assertNotIn(bad, broad,
+                             "BROAD 里混进了 config.yaml 的 YAML 拼写 %s" % bad)
+        for good in ("DOMAINSUFFIX", "IPCIDR", "RULESET"):
+            self.assertIn(good, broad, "BROAD 缺少 %s" % good)
+
     def test_ip_cidr_shadowing_is_caught(self):
         self.seed()
         FakeMihomo.rules = [
-            {"type": "IP-CIDR", "payload": "104.18.1.0/24", "proxy": "DIRECT"},
+            {"type": "IPCIDR", "payload": "104.18.1.0/24", "proxy": "DIRECT"},
             {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
             {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
         ]
@@ -704,7 +760,7 @@ class TestInvariantBypasses(RotateTestBase):
         self.assertTrue(any("遮蔽" in m for m in problems), problems)
 
         FakeMihomo.rules = [
-            {"type": "DST-PORT", "payload": "22", "proxy": "DIRECT"},
+            {"type": "DstPort", "payload": "22", "proxy": "DIRECT"},
             {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
             {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
         ]
@@ -752,7 +808,9 @@ class TestTriStateVerdict(unittest.TestCase):
     def test_leak_gate_uses_state_not_autofall(self):
         """泄漏判定的门必须与 rotate.py 一致，用状态文件的降级标记。"""
         t = self._hook_text()
-        i = t.index("LEAK_N=")
+        # 从**第二个** case（真正决定颜色那一个）起算 ——
+        # 前面还有一个把原始输出归一化的转换块。
+        i = t.index('case "$LEAK_N" in')
         seg = t[i:t.index("esac", i)]
         self.assertIn('DEG_FLAG" = "true"', seg,
                       "门必须用 DEG_FLAG；用 AF_NOW 会在钩子恢复窗口里自相矛盾")
@@ -799,6 +857,78 @@ class TestNoMaterialisation(RotateTestBase):
         s = self.state()
         self.assertNotIn("routing_bad_at", s)
         self.assertNotIn("routing_bad_reason", s)
+
+
+class TestDryRunWritesNothing(RotateTestBase):
+    """--dry-run 必须是只读的。
+
+    install.sh 的第 8 步跑的就是它。人在「状态丢了、AUTOFALL 停在 DIRECT」时
+    最自然的动作就是重跑安装 —— 而一次「试运行」凭空写出状态文件，
+    写出的那份没有 degraded 键，钩子闸门据此判「明确未降级」直接 exit 0，
+    自修路径被自己的验证步骤毁掉。守卫当初要防的那条链，从另一扇门走回来。
+    """
+    def test_dry_run_does_not_create_state_file(self):
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+        r = self.rotate.rotate_once(dry_run=True)
+        self.assertTrue(r)
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists(),
+                         "--dry-run 不得凭空写出状态文件")
+
+    def test_dry_run_still_reports_verdict(self):
+        self.seed()          # 不预置降级：降级分支会先短路返回，那是本该如此
+        for x in FakeMihomo.rules:
+            if x["payload"] == "opencode.ai":
+                x["proxy"] = "DIRECT"
+        buf = io.StringIO(); old = sys.stdout; sys.stdout = buf
+        try:
+            self.rotate.rotate_once(dry_run=True)
+        finally:
+            sys.stdout = old
+        self.assertIn("VIOLATION", buf.getvalue(),
+                      "dry-run 仍要如实报告核对结论")
+
+
+class TestLeakCountContract(RotateTestBase):
+    """--leak-count 的输出契约。
+
+    早先失败时 print("skip") 且 return 1，而调用方写的是
+    `$(rotate.py --leak-count || echo skip)` —— `||` 会把 echo 的输出也收进
+    变量，于是变量变成两行 skip，case 的 skip 模式匹配不上，落进 *) 被当成
+    **泄漏条数**。也就是说 mihomo API 一挂，页面就喊「正在泄漏」。
+    正是上一轮刚消灭的「零证据说泄漏」从另一扇门回来了。
+    """
+
+    def test_direct_leaks_none_means_unknown_not_zero(self):
+        """读不到必须是 None（无法判定），不是 0（没有泄漏）。"""
+        self.seed()
+        saved = self.rotate.API
+        self.rotate.API = "http://127.0.0.1:1"
+        try:
+            self.assertIsNone(self.rotate.direct_leaks())
+        finally:
+            self.rotate.API = saved
+
+    def test_rotate_never_uses_exit_code_for_this(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("if args.leak_count:")
+        j = src.index("if args.", i + 10)          # 到下一个子命令为止
+        # 只看代码行 —— 注释里正是在引用旧的错误写法。
+        blk = chr(10).join(l for l in src[i:j].split(chr(10))
+                        if not l.strip().startswith("#"))
+        self.assertIn("return 0", blk, "判据失效也必须 exit 0")
+        self.assertNotIn("return 1", blk, "契约不得用退出码承载")
+        self.assertIn('"skip" if hits is None', blk)
+
+    def test_consumer_treats_non_numeric_as_skip(self):
+        """消费端必须把任何非纯数字归为「读不到」，而不是条数。"""
+        t = (ROOT / "status.sh").read_text(encoding="utf-8")
+        self.assertNotIn("--leak-count 2>/dev/null || echo skip", t,
+                         "`|| echo skip` 会把 echo 的输出也收进变量")
+        i = t.index('case "$LEAK_RAW" in')
+        seg = t[i:t.index("esac", i)]
+        self.assertIn("*[!0-9]*)", seg,
+                      "缺了非数字防线：rotate.py 崩掉时 log() 走 stdout，"
+                      "变量会是多行日志 + skip")
 
 
 class TestHookInvariants(unittest.TestCase):

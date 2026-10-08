@@ -201,12 +201,33 @@ except Exception:
     #
     # 计数放在排成功之后：排不上就说明这一跳根本没发生，记它等于白烧配额。
     if command -v systemd-run >/dev/null; then
+# 排之前先看有没有**别的**复查链在飞。
+        #
+        # mihomo 崩溃循环时（Restart=always + RestartSec=5s），每一次人工重启
+        # 都会在本文件开头把计数清零，于是反复申请同一个 --unit=...-1；
+        # 而 5 秒前排的那个还在飞 -> systemd-run 失败。早先这里直接说
+        # 「停止自动复查」，等于把本来在正常走的链**连带弄断**，
+        # 而提示还让人再做一遍同样的操作 —— 那是自己制造自己。
+        #
+        # 有在飞的链恰恰说明链还活着，此时正确做法是什么都不做。
+        INFLIGHT=""
+        if command -v systemctl >/dev/null; then
+            INFLIGHT="$(systemctl list-units --all --no-legend --plain \
+                        'surfshark-rotate-resume-*.timer' 2>/dev/null \
+                        | awk '{print $1}' | head -3)"
+        fi
+        if [ -n "$INFLIGHT" ]; then
+            say "已有一条自动复查链在飞，本次不重排："
+            for u in $INFLIGHT; do say "    $u"; done
+            say "  （mihomo 反复重启时会出现：计数被清零导致申请同一个单元名）"
+            exit 0
+        fi
         if ! systemd-run --quiet --collect \
                 --unit="surfshark-rotate-resume-$NEXT" \
                 --on-active="${RECHECK_DELAY}" \
                 /bin/bash "$BASE/on-mihomo-up.sh" --resume \
                 >/dev/null 2>&1; then
-            say "复查排不起来（同名单元未释放或 systemd 拒绝），停止自动复查"
+            say "复查排不起来（systemd 拒绝），停止自动复查"
             say "  修好之后请手工重试：sudo systemctl restart mihomo"
             exit 0
         fi

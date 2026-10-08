@@ -226,7 +226,17 @@ line "泄漏检测"
 # 降级期间出现 DIRECT 是设计如此，不算泄漏，所以只在「未降级」时报。
 # 另外连接是瞬态的：没有流量时查不到 —— 这条检测的是正在发生的泄漏，
 # 不是历史。跨连接的那条判据在下面「分流规则异常」里。
-LEAK_N="$("$PY3" "$BASE/rotate.py" --leak-count 2>/dev/null || echo skip)"
+# 契约：stdout 是一个十进制非负整数，或字面量 skip。**不用退出码承载** ——
+# `|| echo skip` 会把 echo 的输出也收进变量（实测变成两行 skip），
+# 而 case 的 skip 模式匹配不上，于是「读不到」被当成泄漏条数。
+# `*[!0-9]*` 是最后一道防线：rotate.py 崩掉时 log() 走 stdout，
+# 变量会是多行日志 + skip，必须归为「读不到」而不是条数。
+LEAK_RAW="$("$PY3" "$BASE/rotate.py" --leak-count 2>/dev/null)"
+case "$LEAK_RAW" in
+    skip|'')      LEAK_N=skip ;;
+    *[!0-9]*)     LEAK_N=skip ;;
+    *)            LEAK_N="$LEAK_RAW" ;;
+esac
 case "$LEAK_N" in
     skip|"")
         c_warn "  读不到，跳过（mihomo API 可能不通，或 rotate.py 不可用）" ;;

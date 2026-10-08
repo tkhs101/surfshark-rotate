@@ -329,9 +329,23 @@ def check_routing_invariants():
     # 早于本规则命中、且把流量送去 DIRECT 的规则 —— 它们会遮蔽本配置。
     # 只看**宽匹配器**：DST-PORT,22 排在前面是无害的（opencode.ai 走 443，
     # 那条永远不匹配），把它算成遮蔽就是误报。
-    BROAD = {"MATCH", "GEOSITE", "GEOIP", "IP-CIDR", "IP-CIDR6",
-             "RULE-SET", "DOMAIN", "DOMAIN-KEYWORD", "DOMAIN-SUFFIX",
-             "DOMAIN-REGEX", "IN-NAME", "IN-TYPE", "PROCESS-NAME"}
+    # 【这些是 /rules 返回的 Type，不是 config.yaml 里的 YAML 写法】
+    # 早先这里写的是 YAML 拼写（IP-CIDR / DOMAIN-SUFFIX），而 mihomo 返回的是
+    # CamelCase。真机实测：/rules 的 type 取值是 DomainSuffix / DstPort / Match。
+    # .upper() 只能救回没有连字符的那几个，于是 13 条里 8 条是**死的** ——
+    # 而最可能被人手写出来的遮蔽 `DOMAIN-SUFFIX,ai,DIRECT` 恰好落在死区里。
+    # 测试夹具当时也用了同样的错拼写，所以一路绿灯：
+    # **「替身比真实契约宽松」在上一层复发** —— 我们从「替换 api()」进化到了
+    # 「真起 HTTP 服务」，但伪造的 payload 形状仍然是猜的，而 bug 就住在形状里。
+    #
+    # 刻意**不含** InName / InType / ProcessName：它们匹配的是入站与进程，
+    # 命中不了「对 opencode.ai 的普通 HTTPS 连接」。把它们算成宽匹配器的话，
+    # 一条完全合法也无害的 `IN-TYPE,HTTP,DIRECT` 就会被报成遮蔽 ->
+    # VIOLATION -> 退出码 3 -> 轮换停摆，并谎报「你在泄漏本机 IP」。
+    # 一个假的 VIOLATION 代价不小：它会停掉唯一的产出。
+    BROAD = {"MATCH", "DOMAIN", "DOMAINSUFFIX", "DOMAINKEYWORD", "DOMAINREGEX",
+             "GEOSITE", "GEOIP", "IPCIDR", "IPCIDR6", "RULESET"}
+
     def earlier_direct_rules(idx_of):
         hits = []
         for r in rules[:idx_of]:
@@ -974,7 +988,58 @@ def rotate_once(dry_run=False):
     log(f"--- 轮换开始 | 当前节点={live} | 档位={tier+1}/{len(TIERS)} "
         f"({TIERS[tier][0]}...) ---")
 
-    # 1) 切换节点 —— 实测不中断已有连接
+    # 1) 核对已加载的分流规则
+    #
+    # 放在热重载**之后**：重载才是可能让 mihomo 实际生效的规则发生变化的时刻。
+    # 此刻读 /rules 问的是「它现在到底在跑什么」，而磁盘上的 config.yaml 只是
+    # 我们的意图 —— 两者不一致时只有前者说明真相。
+    #
+    # 不符合就退出非零：这是确定性的配置错误，不是网络抖动。退出码非零会让
+    # ExecMainStatus 变红 —— 那是唯一一个「不需要用户做任何事就能看到」的信号。
+    # dry-run 一律不写状态 —— 一个「试运行」写下状态文件本身就是错的。
+    # 而 install.sh 的第 8 步跑的就是 --dry-run：人在「状态丢了、AUTOFALL 停在
+    # DIRECT」时最自然的动作就是重跑安装，跑完一次，自修路径又被自己的验证
+    # 步骤毁掉（凭空物化出来的文件没有 degraded 键，钩子闸门据此判「明确未降级」
+    # 直接 exit 0）。这正是守卫当初要防的那条链，从另一扇门走回来了。
+    verdict, details = check_routing_invariants()
+    if dry_run:
+        # dry-run 只读不写。install.sh 的第 8 步跑的就是它 —— 人在「状态丢了、
+        # AUTOFALL 停在 DIRECT」时最自然的动作就是重跑安装，而一次「试运行」
+        # 凭空写出状态文件，本身就是错的，且它写出的那份没有 degraded 键，
+        # 钩子闸门据此判「明确未降级」直接 exit 0 —— 守卫当初要防的那条链，
+        # 从 install.sh 这扇门走回来。
+        log(f"    (dry-run) 分流核对：{verdict}"
+            + ("  ← " + "; ".join(details[:2]) if details else ""))
+        return True
+
+    if verdict == "UNKNOWN":
+        # 无法判定：**不**升级成泄漏告警，只留痕说明判据此刻失效。
+        for m in details:
+            log(f"?? 分流规则无法核对：{m}")
+        log("   这一刻没有泄漏证据，也没有「规则正常」的证据。人工核对：/rules")
+        update_state({"routing_unknown_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "routing_unknown_reason": "; ".join(details)})
+    else:
+        update_state({}, remove=("routing_unknown_at", "routing_unknown_reason"))
+    if verdict == "VIOLATION":
+        for m in details:
+            log(f"!! 分流规则异常：{m}")
+        log("!! 这会让 opencode.ai 走直连，把本机 IP 泄漏出去，且没有任何其它信号能看见。")
+        log("   权威来源是 mihomo 的 /rules，不是磁盘上的 config.yaml。请人工核对。")
+        update_state({"routing_bad_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "routing_bad_reason": "; ".join(details)})
+        raise SystemExit(3)
+    # 只有**确认正常**才清违规记录。UNKNOWN 不许清 —— 这段早先没判 verdict，
+    # 于是一轮「读不到 /rules」就会把上一轮的确认违规记录删掉，
+    # 并在同一轮日志里先说「无法判定」、隔两行紧接着说「已恢复正常」（实测）。
+    if verdict == "OK" and state.get("routing_bad_at"):
+        # 之前坏过、现在好了。用 remove 通道真正删掉这两个键 ——
+        # 置空串的话键会永久留在文件里，而空串与「从未发生过」在磁盘上
+        # 完全无法区分，那等于把刚建立的历史又抹掉一次。
+        update_state({}, remove=("routing_bad_at", "routing_bad_reason"))
+        log("    分流规则已恢复正常（此前记录到异常）")
+
+    # 2) 切换节点 —— 实测不中断已有连接
     if target != live:
         log(f"    切换 {live} -> {target}")
         if not dry_run:
@@ -986,7 +1051,7 @@ def rotate_once(dry_run=False):
     else:
         log(f"    已在 {target}，跳过切换")
 
-    # 2) 热重载重建隧道 —— 实测同样不中断已有连接
+    # 3) 热重载重建隧道 —— 实测同样不中断已有连接
     #
     # 这里不做「排空等待」，也不做强杀。Windows 版曾经有这两步，
     # 建立在「热重载会杀连接」这个错误前提上；实测推翻后，那套逻辑的
@@ -1014,43 +1079,8 @@ def rotate_once(dry_run=False):
         except Exception:
             pass
 
-    # 2b) 核对已加载的分流规则
-    #
-    # 放在热重载**之后**：重载才是可能让 mihomo 实际生效的规则发生变化的时刻。
-    # 此刻读 /rules 问的是「它现在到底在跑什么」，而磁盘上的 config.yaml 只是
-    # 我们的意图 —— 两者不一致时只有前者说明真相。
-    #
-    # 不符合就退出非零：这是确定性的配置错误，不是网络抖动。退出码非零会让
-    # ExecMainStatus 变红 —— 那是唯一一个「不需要用户做任何事就能看到」的信号。
-    verdict, details = check_routing_invariants()
-    if verdict == "UNKNOWN":
-        # 无法判定：**不**升级成泄漏告警，只留痕说明判据此刻失效。
-        for m in details:
-            log(f"?? 分流规则无法核对：{m}")
-        log("   这一刻没有泄漏证据，也没有「规则正常」的证据。人工核对：/rules")
-        update_state({"routing_unknown_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                      "routing_unknown_reason": "; ".join(details)})
-    else:
-        update_state({}, remove=("routing_unknown_at", "routing_unknown_reason"))
-    if verdict == "VIOLATION":
-        for m in details:
-            log(f"!! 分流规则异常：{m}")
-        log("!! 这会让 opencode.ai 走直连，把本机 IP 泄漏出去，且没有任何其它信号能看见。")
-        log("   权威来源是 mihomo 的 /rules，不是磁盘上的 config.yaml。请人工核对。")
-        update_state({"routing_bad_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                      "routing_bad_reason": "; ".join(details)})
-        raise SystemExit(3)
-    if state.get("routing_bad_at"):
-        # 之前坏过、现在好了。用 remove 通道真正删掉这两个键 ——
-        # 置空串的话键会永久留在文件里，而空串与「从未发生过」在磁盘上
-        # 完全无法区分，那等于把刚建立的历史又抹掉一次。
-        update_state({}, remove=("routing_bad_at", "routing_bad_reason"))
-        log("    分流规则已恢复正常（此前记录到异常）")
-
-    # 3) 验证 IP
-    if dry_run:
-        log("    (dry-run，跳过 IP 检测)")
-        return True
+    # 4) 验证 IP
+    # 上面已在核对之后提前返回 dry-run；到不了这里。
 
     new_ip = exit_ip()
 
@@ -1214,10 +1244,14 @@ def main():
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
     if args.leak_count:
+        # 契约：**永远 exit 0**，判据失效只体现在 stdout 上。
+        # 早先失败时 print("skip") 且 return 1，而调用方写的是
+        # `$(rotate.py --leak-count || echo skip)` —— `||` 会把 echo 的输出
+        # 也收进变量，于是变量变成两行 skip，case 的 skip 模式匹配不上，
+        # 落进 *) 被当成**泄漏条数**：mihomo API 一挂，页面就喊正在泄漏。
+        # 正是上一轮刚消灭的「零证据说泄漏」从另一扇门回来了。
         hits = direct_leaks()
-        if hits is None:
-            print("skip"); return 1
-        print(len(hits))
+        print("skip" if hits is None else len(hits))
         return 0
 
     if args.probe_node:
