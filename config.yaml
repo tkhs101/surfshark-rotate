@@ -176,7 +176,7 @@ proxies:
 #  策略组
 #   FAST     — 只含日韩（实测延迟最低的两档），url-test 自动挑快的
 #   PROXY    — 轮换脚本操作的组，成员顺序即优先级
-#   AUTOFALL — 降级链：PROXY 整个不健康时退到 DIRECT，恢复后自动切回
+#   AUTOFALL — 降级链：PROXY 整个不健康时退到 DIRECT（由 rotate.py 显式切换，不是内核自动翻；恢复同样由 rotate.py 切回）
 # --------------------------------------------------------------
 proxy-groups:
   - name: "FAST"
@@ -198,7 +198,7 @@ proxy-groups:
       - "FAST"
 
   # --------------------------------------------------------------
-  #  降级链：节点全挂时自动退到直连，节点恢复后自动切回
+  #  降级链：节点全挂时退到直连（rotate.py 显式切换），节点恢复后由 rotate.py 切回
   #
   #  【为什么必须有】WireGuard 私钥到期或节点全挂时，PROXY 是 select 组，
   #  mihomo 不会自动回退 —— opencode.ai 与 ip.sb 会直接连不上：

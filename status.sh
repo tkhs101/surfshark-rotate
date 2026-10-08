@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================
 #  Surfshark 轮换 —— 状态速查
-#  故意不用 set -e：诊断脚本里任何一项查不到都不该中断后面���查。
+#  故意不用 set -e：诊断脚本里任何一项查不到都不该中断后面的检查。
 # ==============================================================
 set -uo pipefail
 
@@ -72,7 +72,7 @@ if [ "$AF_NOW" = "DIRECT" ]; then
     c_err  "  IP 轮换已停摆，而轮换正是这个项目存在的理由。"
     c_err  "  常见原因：Surfshark WireGuard 私钥到期 / 被吊销 / 续费后换了新私钥没更新。"
     c_err  "  恢复：换新私钥 → sudo systemctl restart mihomo（钩子会自动启回轮换定时器）"
-    c_warn "  若 2 分钟内没自动恢复，手工执行：sudo systemctl start surfshark-rotate.timer"
+    c_warn "  若 9 分钟内没自动恢复，手工执行：sudo systemctl start surfshark-rotate.timer"
     echo
 fi
 

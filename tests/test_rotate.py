@@ -1138,6 +1138,88 @@ class TestHookBudget(unittest.TestCase):
         self.assertEqual(n, int(_r.hook_worst_case_seconds() + 0.999))
 
 
+class TestInstallGuards(unittest.TestCase):
+    """install.sh 第 8 步的三段判据必须真的能命中。
+
+    早先写成 `grep 轮换开始 && grep 告警`：而分流核对是**无条件前置**的，
+    VIOLATION 会在打印「轮换开始」**之前**就 exit 3 —— 两个条件永远不能同时
+    满足，于是 VIOLATION 落进「无法通过 API 认证」（报错方向完全错），
+    UNKNOWN 走 dry-run 的另一句文案、grep 不到，照样打印绿色「认证正常」。
+    评审实测三种情况后改的，这里把结论锁住。
+    """
+
+    def _install(self):
+        return (ROOT / "install.sh").read_text(encoding="utf-8")
+
+    def test_violation_guard_does_not_require_progress_line(self):
+        src = self._install()
+        # 只看 if 那几行本身 —— 上面的注释里正是在引用「轮换开始」
+        # 来说明为什么不能拿它当条件。
+        i = src.index("分流规则异常")
+        line_start = src.rfind(chr(10), 0, i) + 1
+        cond = src[line_start:src.find(chr(10), i)]
+        self.assertNotIn("轮换开始", cond,
+                         "VIOLATION 时「轮换开始」压根没打印，加这个条件守卫必然落空")
+        self.assertIn("grep -q", cond)
+
+    def test_unknown_guard_matches_the_dry_run_wording(self):
+        src = self._install()
+        self.assertIn("分流核对：UNKNOWN", src,
+                      "dry-run 打印的是这句，不是非 dry-run 的「无法核对」")
+
+    def test_three_cases_are_mutually_exclusive(self):
+        cases = {
+            "!! 分流规则异常：opencode.ai 已加载的规则指向 DIRECT": "die",
+            "    (dry-run) 分流核对：UNKNOWN": "warn",
+            "--- 轮换开始 | 当前节点=JP": "ok",
+        }
+        for text, want in cases.items():
+            if "分流规则异常" in text:
+                got = "die"
+            elif "分流核对：UNKNOWN" in text:
+                got = "warn"
+            elif "轮换开始" in text:
+                got = "ok"
+            else:
+                got = "auth-fail"
+            self.assertEqual(got, want, "判据对 %r 的判定错了" % text[:30])
+
+
+class TestDocClaims(unittest.TestCase):
+    """文档里的具体数字必须与代码常量一致 —— 评审第五轮逐条核对过一轮。"""
+
+    def test_status_hint_matches_recheck_budget(self):
+        hook = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        import re
+        n = int(re.search(r"RECHECK_MAX=(\d+)", hook).group(1))
+        d = int(re.search(r"RECHECK_DELAY=(\d+)", hook).group(1))
+        minutes = (n * d) // 60
+        status = (ROOT / "status.sh").read_text(encoding="utf-8")
+        m = re.search(r"若 (\d+) 分钟内没自动恢复", status)
+        self.assertIsNotNone(m, "status.sh 应说明复查需要多久")
+        self.assertEqual(int(m.group(1)), minutes,
+                         "status.sh 的等待提示与 RECHECK_MAX×RECHECK_DELAY 不符")
+
+    def test_no_replacement_characters_in_docs(self):
+        for f in ("README.md", "status.sh", "config.yaml",
+                  "docs/adr/0001-degradation-owner.md"):
+            txt = (ROOT / f).read_text(encoding="utf-8")
+            self.assertNotIn("�", txt, "%s 里有 U+FFFD 替换字符" % f)
+
+    def test_adr_does_not_reference_removed_api(self):
+        txt = (ROOT / "docs/adr/0001-degradation-owner.md").read_text(encoding="utf-8")
+        self.assertNotIn("replace=True", txt, "save_state/replace= 已被 update_state 取代")
+        self.assertNotIn("save_state", txt)
+
+    def test_config_has_no_fallback_era_claims(self):
+        cfg = (ROOT / "config.yaml").read_text(encoding="utf-8")
+        # 「自动切回/自动选中」是 fallback 组时代的说法
+        for bad in ("恢复后自动切回", "自动退到直连"):
+            self.assertNotIn(bad, cfg,
+                             "config.yaml 仍写着 %r —— AUTOFALL 是 select 组，"
+                             "恢复只由 rotate.py 显式切换" % bad)
+
+
 class TestHookInvariants(unittest.TestCase):
     """只保留**执行真实脚本**或**断言行为**的用例。
 

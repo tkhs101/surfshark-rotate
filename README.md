@@ -368,7 +368,7 @@ TUN 和 4 个 proxy 的 `mtu` 必须同值，不一致会在其中一层卡住�
    照抄别处的值会导致外层包超网卡 MTU 而分片，或直接黑洞。
    装完想确认：`ip link show Mihomo | grep mtu`。
 
-3. **`persistent-keepalive` 保持关闭（有意为之）** —— 本部署每 5 分钟重建一次隧道，NAT 映射的刷新频率远高于任何 UDP 空闲超时（通常 ≥30 分钟），keepalive 在这里没有实际作用，开了只是白费流量。**前提是轮换没被关掉**；如果改成手动轮换或拉长间隔，再考虑开。
+3. **keepalive 实际是开着的** —— 本条曾写成「`persistent-keepalive` 保持关闭（有意为之）」，理由是「NAT 映射刷新频率高于空闲超时、开了白费流量」。**那个前提是错的**：2026-10-09 实测订阅 mihomo 的 `/logs?level=debug`，8 分钟内 `Sending keepalive packet` 14 次、`Receiving keepalive packet` 6 次，中位周期约 34~37 秒。wireguard-go 只在 `persistent_keepalive_interval > 0` 时才发，而 `config.yaml` 里没有这个键 —— 所以是 mihomo 默认开启的。旧结论整段建立在「它关着」这个假前提上，已作废。
 
 4. **配置文件权限 600** —— `config.yaml` 内含 WireGuard 私钥，install.sh 会设为仅 root 可读。mihomo 和 rotate.py 都以 root 运行，不受影响。
 
