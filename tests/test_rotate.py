@@ -1048,6 +1048,18 @@ class TestRecheckCounterCarrier(unittest.TestCase):
             self.assertIn('case "$%s"' % v, src,
                           "%s 必须先净化再进算术展开" % v)
 
+    def test_inflight_hint_is_not_stale(self):
+        """计数搬进 argv 后「计数被清零」那句话已失效。
+
+        计数不再从状态文件读，不会被清零 —— 留着会让人按错误的因果去排查。
+        """
+        src = self._src()
+        # 只看 say 行 —— 注释里正是在引用这句旧归因来说明历史。
+        says = [l for l in src.split(chr(10))
+                if "say " in l and "计数被清零" in l]
+        self.assertEqual(says, [],
+                         "计数由 argv 携带，不会被清零；这句归因已失效：%s" % says)
+
     def test_empty_counter_does_not_stop_rechecking(self):
         """计数没落盘时复查已经排上去了，不能说「停止自动复查」。"""
         src = self._src()
