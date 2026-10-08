@@ -24,3 +24,6 @@ config.yaml.bak-*
 # 杂项
 __pycache__/
 *.pyc
+
+# 临时脚本的输出；我在这里被坑过一次（误提交过 tr.txt）
+tr.txt
