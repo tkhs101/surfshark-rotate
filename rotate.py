@@ -341,7 +341,13 @@ NODE_HEALTH_URLS = (
     "http://www.gstatic.com/generate_204",  # Google
     "http://detectportal.firefox.com/success.txt",  # Mozilla
 )
-NODE_HEALTH_TIMEOUT_MS = 5000           # 单个端点；任一成功即短路返回
+NODE_HEALTH_TIMEOUT_MS = 4000           # 单个端点；任一成功即短路返回
+# 钩子的最坏耗时必须远低于 mihomo.service 的 TimeoutStartSec，否则 systemd 会
+# 在钩子跑完前把它杀掉 —— 后果不是「少查一次」，而是 mihomo 被判 failed 配上
+# Restart=always 反复重启，恢复路径永远跑不完。端点数从 1 扩到 3 时最坏耗时
+# 从 128s 涨到 188s，正好越过了 systemd 默认的 90s，所以这里显式收窄客户端超时，
+# 并且在 mihomo.service 里显式声明 TimeoutStartSec —— 不依赖默认值算术。
+NODE_HEALTH_CLIENT_SLACK = 3
 
 
 def node_healthy(node, timeout_ms=NODE_HEALTH_TIMEOUT_MS):
@@ -359,7 +365,7 @@ def node_healthy(node, timeout_ms=NODE_HEALTH_TIMEOUT_MS):
         u = urllib.parse.quote(raw, safe="")
         try:
             d = api("/proxies/%s/delay?timeout=%d&url=%s"
-                    % (q, timeout_ms, u), timeout=timeout_ms / 1000.0 + 10)
+                    % (q, timeout_ms, u), timeout=timeout_ms / 1000.0 + NODE_HEALTH_CLIENT_SLACK)
             delay = d.get("delay")
             if isinstance(delay, int) and delay > 0:
                 return True
@@ -390,7 +396,8 @@ def probe_node_consecutive(want, gap):
             q = urllib.parse.quote(node, safe="")
             d = api("/proxies/%s/delay?timeout=%d&url=%s"
                     % (q, NODE_HEALTH_TIMEOUT_MS, u),
-                    timeout=NODE_HEALTH_TIMEOUT_MS / 1000.0 + 10)
+                    timeout=NODE_HEALTH_TIMEOUT_MS / 1000.0
+                    + NODE_HEALTH_CLIENT_SLACK)
             last = d.get("delay")
         except Exception:
             pass
@@ -659,8 +666,20 @@ def reset_recheck_tries():
 
     这里是一次纯 setter（只把 recheck_tries 置 0，没有任何删除），
     早先却用了 replace=True 整体覆盖 —— 别人刚写的 last_ip 会被整块盖回旧值。
-    合并写同样能把一个键置 0，且保留其余字段。
+
+    **状态文件不存在时什么都不做。** 早先无条件 update_state，结果把不存在的
+    文件凭空创建成一份默认状态；而钩子在闸门之前调它，于是新建的文件里没有
+    degraded 键，闸门据此判定「明确未降级」直接返回 —— 状态丢失后的数据面恢复
+    路径永远走不到，AUTOFALL 停在 DIRECT 不动。上机实测确认过这条泄漏链。
+    写一个状态文件不是「无害的准备工作」，它会改变下游的判读。
     """
+    if not os.path.exists(STATE_FILE):
+        return
+    try:
+        with open(STATE_FILE, encoding="utf-8") as f:
+            json.load(f)          # 损坏就别覆盖 —— 那是唯一的证据
+    except Exception:
+        return
     update_state({"recheck_tries": 0})
 
 

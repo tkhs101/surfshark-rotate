@@ -395,6 +395,98 @@ class TestMultiUrlProbe(RotateTestBase):
         self.assertIn("--probe-node", src)
 
 
+class TestRealHookGate(unittest.TestCase):
+    """**执行真实的 on-mihomo-up.sh**，而不是它的手抄片段。
+
+    上一版的 TestHookShell 跑的是把闸门逻辑手抄出来的一段 run.sh，而手抄的
+    片段漏掉了同一次提交里新增的几行。于是两个用例（损坏/缺失状态）一路绿，
+    而真实脚本在这两种情况下根本走不到数据面回退 —— 也就是那条永久泄漏链。
+    判据很简单：**要么跑真脚本，要么别测它**。文本断言（assertIn/assertNotIn）
+    只能证明「这行字打对了」，不能证明「行为对」。
+    """
+
+    def _sandbox(self, state_body):
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        (tmp / ".rotate_state.json").write_text(state_body, encoding="utf-8")
+        # 钩子的 BASE 是硬编码的绝对路径，这里不改仓库、只在副本上跑：
+        # 用 sed 把 BASE 指向沙箱，其余逻辑一行不动。
+        hook = (tmp / "on-mihomo-up.sh")
+        src = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        src = src.replace('BASE="/opt/surfshark-rotate"', 'BASE="%s"' % tmp)
+        hook.write_text(src, encoding="utf-8")
+        # 桩：任何子命令都成功返回，且往 stdout 里吐点东西 ——
+        # 钩子必须能在子命令输出被污染时仍正确解析自己的结果。
+        # 桩：任何子命令都成功返回，且往 stdout 里吐点东西 ——
+        # 钩子必须能在子命令输出被污染时仍正确解析自己的结果。
+        stub = chr(10).join([
+            "import sys, pathlib",
+            "log = pathlib.Path(__file__).with_name('stub-calls.log')",
+            "with log.open('a', encoding='utf-8') as f:",
+            "    f.write(' '.join(sys.argv[1:2]) + chr(10))",
+            "sys.exit(0)", ""])
+        (tmp / "rotate.py").write_text(stub, encoding="utf-8")
+        return tmp, hook
+
+    def _calls(self, tmp):
+        f = tmp / "stub-calls.log"
+        return f.read_text(encoding="utf-8") if f.exists() else ""
+
+    def _run(self, state_body, args=()):
+        tmp, hook = self._sandbox(state_body)
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        r = subprocess.run(["bash", str(hook), *args],
+                           capture_output=True, text=True, timeout=60)
+        return tmp, r
+
+    def test_degraded_state_resets_counter(self):
+        """确认处于降级态时，计数必须被归零 —— 这是人工重试能重新开始复查的唯一途径。"""
+        tmp, r = self._run('{"degraded": true, "recheck_tries": 6}')
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("--reset-recheck", self._calls(tmp))
+
+    def test_not_degraded_exits_without_writing_anything(self):
+        """明确未降级 = 正常路径，必须零写入、零子命令调用。"""
+        tmp, r = self._run('{"degraded": false, "tier": 2}')
+        st = json.loads((tmp / ".rotate_state.json").read_text(encoding="utf-8"))
+        self.assertEqual(st, {"degraded": False, "tier": 2},
+                         "明确未降级时必须是零写入，状态文件不能被动过")
+        self.assertEqual(self._calls(tmp), "", "零开销路径不该调用任何子命令")
+
+    def test_resume_flag_does_not_reset_counter(self):
+        """链式复查不能归零 —— 每次都归零的话上限永远触发不了。"""
+        tmp, r = self._run('{"degraded": true, "recheck_tries": 3}', args=("--resume",))
+        self.assertEqual(r.returncode, 0)
+        self.assertNotIn("--reset-recheck", self._calls(tmp))
+
+    def test_missing_state_file_is_not_recreated(self):
+        """L1 回归的精确守卫。
+
+        钩子曾在闸门之前调 --reset-recheck，把不存在的状态文件凭空创建出来，
+        于是闸门读到一份没有 degraded 键的默认状态、判定「明确未降级」直接返回，
+        数据面回退永远走不到 —— AUTOFALL 停在 DIRECT 不动，永久泄漏。
+        """
+        tmp, hook = self._sandbox("{}")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        (tmp / ".rotate_state.json").unlink()
+        r = subprocess.run(["bash", str(hook)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0)
+        self.assertFalse((tmp / ".rotate_state.json").exists(),
+                         "状态文件缺失时绝不能被物化出来")
+        self.assertNotIn("--reset-recheck", self._calls(tmp),
+                         "读不出状态时不该去写它 —— 那正是 L1 的成因")
+
+    def test_corrupt_state_file_is_not_overwritten(self):
+        """L2：覆盖坏文件会销毁唯一的证据，也让 STATE_UNKNOWN 失效。"""
+        tmp, hook = self._sandbox("{}")
+        self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
+        raw = '{"tier": 3, "last'
+        (tmp / ".rotate_state.json").write_text(raw, encoding="utf-8")
+        r = subprocess.run(["bash", str(hook)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0)
+        self.assertEqual((tmp / ".rotate_state.json").read_text(encoding="utf-8"), raw,
+                         "损坏的状态文件是唯一证据，不能被覆盖")
+
+
 class TestHookShell(unittest.TestCase):
     """on-mihomo-up.sh 的分支逻辑。用 bash 实跑，不用 shell 替身。"""
 

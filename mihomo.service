@@ -21,6 +21,11 @@ LimitNOFILE=1048576
 # 配上 Restart=always 就会反复重启一个内核完全健康的服务。
 ExecStartPost=/opt/surfshark-rotate/on-mihomo-up.sh
 
+# 钩子的最坏耗时随探针端点数线性增长。systemd 默认 90s，钩子一旦越线会被
+# 当场杀掉 —— 那不是「少查一次」，而是 mihomo 判 failed，配上 Restart=always
+# 反复重启一台内核健康的服务，恢复路径永远跑不完。显式放宽，不依赖默认值。
+TimeoutStartSec=300
+
 # 每次停止后清理可能残留的策略路由。
 # mihomo 被 OOM 或 SIGKILL 时不会自己清理，残留规则会让整机流量
 # 指向不存在的 TUN 设备，表现为 SSH 突然断连且无法自行恢复。

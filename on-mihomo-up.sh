@@ -68,9 +68,6 @@ say() { printf '[on-mihomo-up] %s\n' "$*"; }
 # 它能一直停在上限值上，于是人工重试照样一次都不查。
 RESUMED=0
 [ "${1:-}" = "--resume" ] && RESUMED=1
-if [ "$RESUMED" = "0" ]; then
-    "$PY3" "$BASE/rotate.py" --reset-recheck >/dev/null 2>&1
-fi
 
 STATE_UNKNOWN=0
 if [ -f "$STATE" ]; then
@@ -86,6 +83,23 @@ except Exception:
     esac
 else
     STATE_UNKNOWN=1
+fi
+
+# 复查计数归零 —— 位置很重要，必须在闸门**之后**。
+#
+# 早先放在闸门之前，于是无论状态如何都先跑一次 `rotate.py --reset-recheck`，
+# 而它会走 update_state -> load_state -> _write_atomic，把**不存在的状态文件
+# 凭空创建出来**（内容是一份默认状态）。紧接着闸门读这个新建的文件：文件存在
+# 于是走 case 0/1 分支，degraded 键不存在 -> case 1) exit 0。
+# 于是「状态文件丢失 -> 钩子应当改用数据面判断」这条恢复路径**永远走不到**，
+# 而 AUTOFALL 还停在 DIRECT —— 上机实测确认：钩子零输出、退出码 0、永久泄漏。
+# 同样是那一次改动引入的：我为了修「重启 mihomo 不重置计数」，把更早的
+# 「状态丢失可自修」又打了回去。
+#
+# 现在只在确认处于降级态之后才归零；状态读不出来时**一个字都不写**，
+# 既不物化文件，也不覆盖损坏文件（覆盖会销毁唯一的证据）。
+if [ "$STATE_UNKNOWN" = "0" ] && [ "$RESUMED" = "0" ]; then
+    "$PY3" "$BASE/rotate.py" --reset-recheck >/dev/null 2>&1
 fi
 
 if [ "$STATE_UNKNOWN" = "1" ]; then
