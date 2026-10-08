@@ -33,6 +33,8 @@ import tempfile
 import threading
 import urllib.parse
 import unittest
+
+CRLF_BYTES = bytes([13, 10])
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -77,7 +79,11 @@ class FakeMihomo(BaseHTTPRequestHandler):
                                     "uploadTotal": 0, "downloadTotal": 0})
         for name in self.groups:
             if self.path == "/proxies/" + name:
-                return self._send(200, dict(self.groups[name], type="Selector"))
+                g = self.groups[name]
+                payload = dict(g, type=g.get("type", "Selector"))
+                if "all" not in payload:
+                    payload["all"] = []
+                return self._send(200, payload)
             if "/delay?" in self.path or self.path.endswith("/delay"):
                 from urllib.parse import parse_qs, unquote, urlparse
                 path_only = urlparse(self.path).path
@@ -128,7 +134,8 @@ class RotateTestBase(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
         FakeMihomo.groups = {
-            "AUTOFALL": {"now": "PROXY", "all": ["PROXY", "DIRECT"]},
+            "AUTOFALL": {"now": "PROXY", "all": ["PROXY", "DIRECT"],
+                         "type": "Selector"},
             "PROXY": {"now": "JP 日本-东京", "all": ["JP 日本-东京", "KR 韩国-首尔"]},
         }
         FakeMihomo.delays = {"JP 日本-东京": 137, "KR 韩国-首尔": 42}
@@ -397,7 +404,7 @@ class TestMultiUrlProbe(RotateTestBase):
         self.seed()
         self.assertTrue(self.rotate.probe_node_consecutive(2, 0)[0])
         FakeMihomo.dead_urls = set(self.rotate.NODE_HEALTH_URLS)
-        ok, _ = self.rotate.probe_node_consecutive(2, 0)
+        ok, _, _ = self.rotate.probe_node_consecutive(2, 0)
         self.assertFalse(ok)
 
     def test_hook_has_no_hardcoded_probe_url(self):
@@ -543,6 +550,38 @@ class TestLeakDetection(RotateTestBase):
         self.assertEqual(len(self.rotate.direct_leaks()), 1,
                          "sniffer 还原出的域名也要认 —— 那正是失效模式本身")
 
+    def test_sniffer_failure_is_detected_by_ip(self):
+        """**这是这条检测被写出来要覆盖的失效模式本身。**
+
+        sniffer 失效的后果恰恰是 metadata 里一个域名都没有 —— host 空、
+        sniffHost 空，只剩 destinationIP。早先的实现拿域名做子串匹配，
+        于是对它自己的目标失明：实测返回 []。必须按 IP 反查才能抓到。
+        """
+        self.seed()
+        ips = self.rotate._leak_ips()
+        if not ips:
+            self.skipTest("本机解析不到 opencode.ai，无法构造这个用例")
+        real_ip = sorted(ips)[0]
+        FakeMihomo.connections = [
+            {"metadata": {"host": "", "sniffHost": "", "destinationIP": real_ip},
+             "chains": ["DIRECT"]}]
+        hits = self.rotate.direct_leaks()
+        self.assertEqual(len(hits), 1,
+                         "无域名、纯 IP、chains[0]=DIRECT —— 必须按 IP 认出")
+        self.assertEqual(hits[0][2], "by-ip")
+
+    def test_proxied_connection_not_flagged_even_with_bare_ip(self):
+        """反向误报检查：走代理的同 IP 连接不该被报成泄漏。"""
+        self.seed()
+        ips = self.rotate._leak_ips()
+        if not ips:
+            self.skipTest("本机解析不到 opencode.ai")
+        FakeMihomo.connections = [
+            {"metadata": {"host": "", "sniffHost": "",
+                          "destinationIP": sorted(ips)[0]},
+             "chains": ["JP 日本-东京", "PROXY", "AUTOFALL"]}]
+        self.assertEqual(self.rotate.direct_leaks(), [])
+
     def test_returns_none_when_api_unreachable(self):
         self.seed()
         saved = self.rotate.API
@@ -563,8 +602,8 @@ class TestRoutingInvariants(RotateTestBase):
 
     def test_ok_when_rules_match(self):
         self.seed()
-        ok, problems = self.rotate.check_routing_invariants()
-        self.assertTrue(ok, "正常配置不该报错：%s" % problems)
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "OK", "正常配置不该报错：%s" % problems)
 
     def test_detects_opencode_pointed_at_direct(self):
         """本次评审要求抓的核心失效。"""
@@ -572,16 +611,16 @@ class TestRoutingInvariants(RotateTestBase):
         for r in FakeMihomo.rules:
             if r["payload"] == "opencode.ai":
                 r["proxy"] = "DIRECT"
-        ok, problems = self.rotate.check_routing_invariants()
-        self.assertFalse(ok)
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")
         self.assertTrue(any("opencode.ai" in m for m in problems), problems)
 
     def test_detects_missing_rule(self):
         """规则被删掉 -> 落进 MATCH,DIRECT，同样是泄漏。"""
         self.seed()
         FakeMihomo.rules = [r for r in FakeMihomo.rules if r["payload"] != "opencode.ai"]
-        ok, problems = self.rotate.check_routing_invariants()
-        self.assertFalse(ok)
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")
         self.assertTrue(any("找不到" in m for m in problems), problems)
 
     def test_detects_ip_sb_probe_misrouting(self):
@@ -590,8 +629,8 @@ class TestRoutingInvariants(RotateTestBase):
         for r in FakeMihomo.rules:
             if r["payload"] == "ip.sb":
                 r["proxy"] = "AUTOFALL"
-        ok, problems = self.rotate.check_routing_invariants()
-        self.assertFalse(ok, "ip.sb 挂在 AUTOFALL 上是已知的坏设计，必须能检出")
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION", "ip.sb 挂在 AUTOFALL 上必须能检出")
 
     def test_unreadable_is_not_treated_as_ok(self):
         """无法判定不等于通过 —— 把不确定当确定是典型的静默失败。"""
@@ -599,95 +638,167 @@ class TestRoutingInvariants(RotateTestBase):
         saved = self.rotate.API
         self.rotate.API = "http://127.0.0.1:1"
         try:
-            ok, problems = self.rotate.check_routing_invariants()
-            self.assertFalse(ok, "读不到 /rules 时不能返回通过")
+            verdict, problems = self.rotate.check_routing_invariants()
+            self.assertEqual(verdict, "UNKNOWN",
+                             "读不到 /rules 是「无法判定」，既不是通过也不是违规")
             self.assertTrue(problems)
         finally:
             self.rotate.API = saved
 
 
-class TestHookShell(unittest.TestCase):
-    """on-mihomo-up.sh 的分支逻辑。用 bash 实跑，不用 shell 替身。"""
+class TestInvariantBypasses(RotateTestBase):
+    """三条实测可绕过的不变量检查，全部来自对抗评审。
 
-    @classmethod
-    def setUpClass(cls):
-        cls.hook = ROOT / "on-mihomo-up.sh"
-        cls.tmp = tempfile.mkdtemp()
-        # 抽出一段与真实脚本同源的判定逻辑来跑分支
-        cls.snippet = pathlib.Path(cls.tmp) / "case.sh"
+    之前 44 例全绿而检查可被绕过 —— 假服务的规则表只覆盖了「正确」形态。
+    """
 
-    @classmethod
-    def tearDownClass(cls):
-        shutil.rmtree(cls.tmp, ignore_errors=True)
+    def test_geosite_rule_shadowing_is_caught(self):
+        """加一条 GEOSITE,opencode,DIRECT 排在前面就能完全遮蔽。"""
+        self.seed()
+        FakeMihomo.rules = [
+            {"type": "GEOSITE", "payload": "opencode", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION", "遮蔽必须被发现")
+        self.assertTrue(any("遮蔽" in m for m in problems), problems)
 
-    def _run(self, state_body, present=True):
-        sp = pathlib.Path(self.tmp) / "state.json"
-        if present:
-            sp.write_text(state_body)
-        snippet = '''
-STATE="$1"
-STATE_UNKNOWN=0
-if [ -f "$STATE" ]; then
-    python3 -c 'import json,sys
-try:
-    sys.exit(0 if json.load(open(sys.argv[1])).get("degraded") else 1)
-except Exception:
-    sys.exit(2)' "$STATE" 2>/dev/null
-    case "$?" in
-        0) echo CONTINUE_UNKNOWN0 ;;
-        1) echo EXIT_QUIET ;;
-        *) STATE_UNKNOWN=1 ;;
-    esac
-else
-    STATE_UNKNOWN=1
-fi
-echo "CONTINUE_UNKNOWN=$STATE_UNKNOWN"
-'''
-        f = pathlib.Path(self.tmp) / "run.sh"
-        f.write_text("#!/usr/bin/env bash\nset -uo pipefail\n" + snippet)
-        target = sp if present else pathlib.Path(self.tmp) / "nope.json"
-        r = subprocess.run(["bash", str(f), str(target)],
-                           capture_output=True, text=True)
-        return r.stdout.strip(), r.returncode
+    def test_ip_cidr_shadowing_is_caught(self):
+        self.seed()
+        FakeMihomo.rules = [
+            {"type": "IP-CIDR", "payload": "104.18.1.0/24", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")
+        self.assertTrue(any("遮蔽" in m for m in problems), problems)
 
-    def test_degraded_continues(self):
-        out, rc = self._run('{"degraded": true}')
-        self.assertIn("CONTINUE_UNKNOWN0", out)
-        self.assertEqual(rc, 0)
+    def test_autofall_members_without_proxy_is_caught(self):
+        """规则指向 AUTOFALL「完全正确」，但组被掏空成只剩 DIRECT。"""
+        self.seed()
+        FakeMihomo.groups["AUTOFALL"]["all"] = ["DIRECT"]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")
+        self.assertTrue(any("缺少 PROXY" in m for m in problems), problems)
 
-    def test_not_degraded_exits_quietly(self):
-        out, rc = self._run('{"degraded": false}')
-        self.assertIn("EXIT_QUIET", out)
-        self.assertEqual(rc, 0)
+    def test_autofall_type_must_be_selector(self):
+        """类型不是 select 的话内核会自行翻组，降级归属失效。"""
+        self.seed()
+        FakeMihomo.groups["AUTOFALL"]["type"] = "Fallback"
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")
+        self.assertTrue(any("Selector" in m for m in problems), problems)
 
-    def test_corrupt_falls_through_to_dataplane(self):
-        out, rc = self._run('{"tier": 3, "last')
-        self.assertIn("CONTINUE_UNKNOWN=1", out)
-        self.assertEqual(rc, 0)
+    def test_harmless_leading_rule_does_not_false_alarm(self):
+        """前面有指向 PROXY/AUTOFALL 的规则不该被报成遮蔽。"""
+        self.seed()
+        FakeMihomo.rules = [
+            {"type": "GeoIP", "payload": "cn", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "VIOLATION")   # GeoIP,cn 排在前面确实会遮蔽，应当报
+        self.assertTrue(any("遮蔽" in m for m in problems), problems)
 
-    def test_missing_falls_through(self):
-        out, rc = self._run("", present=False)
-        self.assertIn("CONTINUE_UNKNOWN=1", out)
-        self.assertEqual(rc, 0)
+        FakeMihomo.rules = [
+            {"type": "DST-PORT", "payload": "22", "proxy": "DIRECT"},
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+        ]
+        verdict, problems = self.rotate.check_routing_invariants()
+        self.assertEqual(verdict, "OK", "SSH 规则在前面是无害的：%s" % problems)
+
+
+class TestTriStateVerdict(unittest.TestCase):
+    """三态的**语义**本身要测，而不只是各分支返回什么字符串。
+
+    背景：早先把「确认违规」与「无法判定」塞进同一条路径，于是 /rules 返回一次
+    500 也会写出 routing_bad_at，而 status.sh 把那条记录翻译成
+    「把本机 IP 泄漏出去」——在零泄漏证据的情况下说出这句话。
+    """
+
+    def _hook_text(self):
+        return (ROOT / "status.sh").read_text(encoding="utf-8")
+
+    def test_unknown_never_writes_the_leak_field(self):
+        """UNKNOWN 分支不得写 routing_bad_at。"""
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index('if verdict == "UNKNOWN":')
+        blk = src[i:src.index('if verdict == "VIOLATION":')]
+        self.assertIn("routing_unknown_at", blk)
+        self.assertNotIn("routing_bad_at", blk,
+                         "UNKNOWN 分支写 routing_bad_at 会造出假的泄漏告警")
+
+    def test_violation_raises_exit_3(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index('if verdict == "VIOLATION":')
+        self.assertIn("raise SystemExit(3)", src[i:i + 700])
+
+    def test_status_banner_wording_distinguishes_verdicts(self):
+        """status.sh 必须能区分「确认违规」与「无法判定」两种文案。"""
+        t = self._hook_text()
+        self.assertIn("routing_bad_at", t)
+        self.assertIn("正在泄漏", t)
+        # 无法判定的措辞必须是「无法核对」而不是「泄漏」
+        if "routing_unknown_at" in t:
+            seg = t[t.index("routing_unknown_at"):]
+            seg = seg[:seg.index(chr(10) + "fi")]
+            self.assertNotIn("泄漏", seg,
+                             "无法判定的横幅里不该出现「泄漏」字样")
+
+    def test_leak_gate_uses_state_not_autofall(self):
+        """泄漏判定的门必须与 rotate.py 一致，用状态文件的降级标记。"""
+        t = self._hook_text()
+        i = t.index("LEAK_N=")
+        seg = t[i:t.index("esac", i)]
+        self.assertIn('DEG_FLAG" = "true"', seg,
+                      "门必须用 DEG_FLAG；用 AF_NOW 会在钩子恢复窗口里自相矛盾")
+
+
+class TestHookInvariants(unittest.TestCase):
+    """只保留**执行真实脚本**或**断言行为**的用例。
+
+    原先这里还有一个 TestHookShell，跑的是把三态闸门手抄出来的 run.sh。
+    那份片段是在真实钩子之外另写的一份实现，且从未随钩子更新 ——
+    它声称「用 bash 实跑，不用 shell 替身」，实际跑的是替身，而文档字符串
+    一直在说谎。TestRealHookGate（跑真脚本）加入后它本该被删掉，却因为
+    两者互不干扰而一直绿着。同一件事有两种测法、一种是真的一种是假的，
+    假的那份提供的是虚假信心。已删除。
+    """
 
     def test_hook_is_valid_bash(self):
-        r = subprocess.run(["bash", "-n", str(self.hook)],
+        r = subprocess.run(["bash", "-n", str(ROOT / "on-mihomo-up.sh")],
                            capture_output=True, text=True)
         self.assertEqual(r.returncode, 0, r.stderr)
-        b = self.hook.read_bytes()
-        self.assertEqual(b.count(b"\r\n"), 0,
+        b = (ROOT / "on-mihomo-up.sh").read_bytes()
+        self.assertEqual(b.count(CRLF_BYTES), 0,
                          "钩子带 CRLF 会报 syntax error（$'in\\r'）")
 
-    def test_recheck_unit_names_are_unique(self):
-        """固定单元名会让复查链只能走一跳 —— 第 2 跳必然 already loaded。"""
-        t = self.hook.read_text(encoding="utf-8")
-        self.assertIn("--unit=\"surfshark-rotate-resume-$NEXT\"", t)
-        self.assertNotIn("--unit=surfshark-rotate-resume \\", t)
+    def test_probe_endpoints_live_in_rotate_only(self):
+        """探针 URL 只允许出现在 rotate.py 一处。
 
-    def test_counter_warning_is_not_neutralised(self):
-        """`|| echo "$NEXT"` 会让 GOT 恒等于 NEXT，告警永远不触发。"""
-        t = self.hook.read_text(encoding="utf-8")
-        self.assertNotIn('--recheck-tried 2>/dev/null || echo "$NEXT"', t)
+        这条不是纯文本洁癖：钩子里硬编码过一个已废弃的 URL，表现为恢复永远
+        判不健康、机器安静地一直直连。判据取「钩子里不许出现任何一个端点」，
+        而不是「某行必须这么写」—— 后者只证明这行字打对了。
+        """
+        import rotate as _r
+        src = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        for u in _r.NODE_HEALTH_URLS:
+            self.assertNotIn(u, src, "钩子里硬编码了探针 URL %s" % u)
+        self.assertIn("--probe-node", src)
+
+    def test_counter_warning_not_neutralised_by_or_else(self):
+        """`|| echo "$NEXT"` 会让 GOT 恒等于 NEXT，告警永远不触发。
+
+        早先的版本正是这么写的，而紧挨着的注释还写着「计数没落盘会让上限
+        永远不生效」—— 那个 || 恰好废掉了自己刚加的告警。
+        """
+        src = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        self.assertNotIn('--recheck-tried 2>/dev/null || echo "$NEXT"', src)
+
 
 
 if __name__ == "__main__":

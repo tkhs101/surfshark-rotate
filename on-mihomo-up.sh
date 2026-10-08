@@ -181,9 +181,11 @@ except Exception:
     if [ "$NEXT" -gt "$RECHECK_MAX" ]; then
         say "已复查 $TRIES 次仍未恢复，停止自动复查（不会有人来修的）"
         say "  现在是降级态：opencode.ai 走直连还能用，但出口是本机 IP，轮换已停摆。"
-        say "  修好之后二选一（两者都会把复查计数归零、重新开始自动复查）："
-        say "            sudo systemctl restart mihomo"
-        say "            或直接 sudo systemctl start $TIMER"
+        say "  修好之后：sudo systemctl restart mihomo"
+        say "            这一条会把复查计数归零、重新开始自动复查。"
+        say "  只想手工启回轮换：sudo systemctl start $TIMER"
+        say "            但它**不**重置计数 —— 节点若仍不通，五分钟后本脚本"
+        say "            会再次停掉定时器，且不再自动复查。重启 mihomo 才会重来。"
         exit 0
     fi
 

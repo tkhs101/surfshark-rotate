@@ -39,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import socket
 import time
 import urllib.error
 import urllib.parse
@@ -294,17 +295,29 @@ def reload_config():
 def check_routing_invariants():
     """核对 mihomo 实际加载的规则是否符合分流不变量。
 
-    返回 (是否全部符合, 说明文字列表)。读不到 /rules 时视为「无法判定」并返回
-    False —— 无法判定不该被当成通过，那是把不确定当确定的典型错误。
+    返回 ("OK" | "VIOLATION" | "UNKNOWN", 说明文字列表)。
+
+    三态而不是布尔：「确认违规」与「无法判定」必须分开。读不到 /rules、
+    读不到组成员表，都属于 UNKNOWN —— 无法判定既不该被当成通过，
+    更不该被当成泄漏。后者更糟：它会让 status.sh 在零证据的情况下
+    说出「正在泄漏」。
     """
     problems = []
+    unknown = []
     try:
         rules = (api("/rules") or {}).get("rules") or []
     except Exception as e:
-        return False, [f"读不到 /rules：{type(e).__name__}: {e}"]
+        return "UNKNOWN", [f"读不到 /rules：{type(e).__name__}: {e}"]
     if not rules:
-        return False, ["/rules 返回空规则表"]
+        return "UNKNOWN", ["/rules 返回空规则表"]
 
+    # mihomo 的求值是**第一条命中即生效**，所以这里必须按顺序取第一条，
+    # 而不是「任意一条 payload 含该子串的规则」。早先的实现遍历全部规则、
+    # 返回第一条子串匹配，于是任何排在前面、payload 不含该字面量的规则
+    # 都能遮蔽真正生效的那条 —— 实测三条绕过：
+    #   GEOSITE,opencode,DIRECT   / IP-CIDR,104.18.1.0/24,DIRECT
+    #   / DOMAIN,opencode.ai,DIRECT
+    # 而「加一条 GEOSITE 规则」是很自然的动作。
     def target_of(needle):
         for r in rules:
             if not isinstance(r, dict):
@@ -313,16 +326,71 @@ def check_routing_invariants():
                 return r.get("proxy")
         return None
 
+    # 早于本规则命中、且把流量送去 DIRECT 的规则 —— 它们会遮蔽本配置。
+    # 只看**宽匹配器**：DST-PORT,22 排在前面是无害的（opencode.ai 走 443，
+    # 那条永远不匹配），把它算成遮蔽就是误报。
+    BROAD = {"MATCH", "GEOSITE", "GEOIP", "IP-CIDR", "IP-CIDR6",
+             "RULE-SET", "DOMAIN", "DOMAIN-KEYWORD", "DOMAIN-SUFFIX",
+             "DOMAIN-REGEX", "IN-NAME", "IN-TYPE", "PROCESS-NAME"}
+    def earlier_direct_rules(idx_of):
+        hits = []
+        for r in rules[:idx_of]:
+            if not isinstance(r, dict):
+                continue
+            if str(r.get("proxy") or "") != "DIRECT":
+                continue
+            if str(r.get("type") or "").upper() not in BROAD:
+                continue
+            hits.append("%s,%s" % (r.get("type"), r.get("payload")))
+        return hits
+
     for host, want, tag in (("opencode.ai", AUTOFALL, "opencode.ai"),
                             ("ip.sb", "PROXY", "出口 IP 探测")):
-        got = target_of(host)
+        idx, got = None, None
+        for i, r in enumerate(rules):
+            if isinstance(r, dict) and host in str(r.get("payload") or ""):
+                idx, got = i, r.get("proxy")
+                break
         if got is None:
             problems.append(f"{host} 的分流规则在已加载的规则表里找不到"
                             f"（tag={tag}）—— 它会落进 MATCH,DIRECT，直接泄漏")
-        elif got != want:
+            continue
+        if got != want:
             problems.append(f"{host} 已加载的规则指向 {got}，应为 {want}"
                             f"（tag={tag}）")
-    return (not problems), problems
+        # 前面的 DIRECT 规则会遮蔽它：mihomo 取第一条命中，压根走不到这条。
+        shadow = earlier_direct_rules(idx)
+        if shadow:
+            problems.append(
+                f"{host} 前面有 {len(shadow)} 条指向 DIRECT 的规则会遮蔽它"
+                f"（mihomo 取第一条命中）：{'、'.join(shadow[:3])}"
+                f" —— 实际生效的是 DIRECT")
+
+    # AUTOFALL 组本身必须仍然含 PROXY。规则指向 AUTOFALL「完全正确」，
+    # 但若成员被掏空成只剩 DIRECT，AUTOFALL 就等于直连，而上面那条检查
+    # 读不到这一点 —— 实测这就是一条绕过路径。
+    try:
+        grp = api("/proxies/" + urllib.parse.quote(AUTOFALL, safe="")) or {}
+        members = grp.get("all") or []
+        if "PROXY" not in members:
+            problems.append(f"{AUTOFALL} 组成员缺少 PROXY（当前 {members}）—— "
+                            f"即使规则指向它，opencode.ai 也会走直连")
+        if str(grp.get("type")) != "Selector":
+            problems.append(f"{AUTOFALL} 的类型是 {grp.get('type')} 而不是 Selector —— "
+                            f"内核会自行判断分组，降级归属将失效")
+    except Exception as e:
+        unknown.append(f"读不到 {AUTOFALL} 的成员表：{type(e).__name__}: {e}")
+
+    # 三态而不是布尔：「确认违规」与「无法判定」必须分开。
+    # 早先把两者塞进同一个 problems，于是 /rules 返回一次 500 也会写出
+    # routing_bad_at，而 status.sh 会把那条记录翻译成「把本机 IP 泄漏出去」——
+    # 在零泄漏证据的情况下说出这句话。这正是本函数 docstring 反对的
+    # 「把不确定当确定」，自己却犯了。
+    if problems:
+        return "VIOLATION", problems
+    if unknown:
+        return "UNKNOWN", unknown
+    return "OK", []
 
 
 # 需要盯的流量。opencode.ai 是唯一「泄漏即严重」的目标：它直连时，
@@ -353,18 +421,56 @@ def direct_leaks():
     except Exception:
         return None
     hits = []
+    # sniffer 失效时 metadata 里一个域名都没有，只剩 destinationIP ——
+    # 而「sniffer 失效」正是这条检测被写出来要覆盖的失效模式之一。
+    # 所以必须同时按 IP 反查，否则它对它自己的目标失明（实测过）。
+    ip_pool = _leak_ips()
     for c in (data.get("connections") or []):
         if not isinstance(c, dict):
             continue
         md = c.get("metadata") or {}
-        hosts = (md.get("host"), md.get("sniffHost"), md.get("destinationIP") or "")
-        dst = md.get("destinationIP") or ""
-        if not any(LEAK_HOST in (h or "") for h in hosts) and            not (dst and LEAK_HOST in str(md.get("host") or "")):
-            continue
         chains = c.get("chains") or []
-        if chains and chains[0] == "DIRECT":
-            hits.append((md.get("host") or md.get("destinationIP") or "?", dst))
+        if not (chains and chains[0] == "DIRECT"):
+            continue                      # 先判链路，省掉后面的字符串拼接
+        host = md.get("host") or ""
+        sniff = md.get("sniffHost") or ""
+        dst = md.get("destinationIP") or ""
+        by_name = LEAK_HOST in host or LEAK_HOST in sniff
+        by_ip = bool(dst) and dst in ip_pool
+        if by_name or by_ip:
+            hits.append((host or sniff or dst, dst, "by-ip" if by_ip and not by_name
+                         else "by-name"))
     return hits
+
+
+_IP_CACHE = {"at": 0.0, "ips": set()}
+
+
+def _leak_ips(ttl=900):
+    """opencode.ai 当前解析到的 IP 集合，带 TTL 缓存。
+
+    Cloudflare 前端，地址会变，所以带 TTL 而不是写死。但缓存是为了不每轮
+    都去做一次 DNS —— 15 分钟一次足够，而一条连接通常活不过几分钟。
+    解析失败时返回上一份缓存而不是空集：宁可多看几条，也不要因为
+    一次解析失败就把正在泄漏的连接全判成无关。
+    """
+    now = time.time()
+    if now - _IP_CACHE["at"] < ttl:
+        return _IP_CACHE["ips"]
+    ips = set()
+    try:
+        for fam in (socket.AF_INET, socket.AF_INET6):
+            try:
+                for r in socket.getaddrinfo(LEAK_HOST, 443, fam):
+                    ips.add(r[4][0])
+            except OSError:
+                pass
+    except Exception:
+        pass
+    if ips:
+        _IP_CACHE["ips"] = ips
+        _IP_CACHE["at"] = now
+    return _IP_CACHE["ips"]
 
 
 def conns_on(node):
@@ -471,13 +577,13 @@ def probe_node_consecutive(want, gap):
     """
     node = api("/proxies/PROXY").get("now") or ""
     if not node:
-        return False, None
+        return False, None, ""
     last = None
     for i in range(max(1, want)):
         if i:
             time.sleep(gap)
         if not node_healthy(node):
-            return False, None
+            return False, None, node
         try:                      # 只为把延迟显示在日志里，失败无所谓
             u = urllib.parse.quote(NODE_HEALTH_URLS[0], safe="")
             q = urllib.parse.quote(node, safe="")
@@ -488,7 +594,7 @@ def probe_node_consecutive(want, gap):
             last = d.get("delay")
         except Exception:
             pass
-    return True, last
+    return True, last, node
 
 
 def mark_degraded(state, reason):
@@ -899,14 +1005,23 @@ def rotate_once(dry_run=False):
     #
     # 不符合就退出非零：这是确定性的配置错误，不是网络抖动。退出码非零会让
     # ExecMainStatus 变红 —— 那是唯一一个「不需要用户做任何事就能看到」的信号。
-    ok, problems = check_routing_invariants()
-    if not ok:
-        for m in problems:
+    verdict, details = check_routing_invariants()
+    if verdict == "UNKNOWN":
+        # 无法判定：**不**升级成泄漏告警，只留痕说明判据此刻失效。
+        for m in details:
+            log(f"?? 分流规则无法核对：{m}")
+        log("   这一刻没有泄漏证据，也没有「规则正常」的证据。人工核对：/rules")
+        update_state({"routing_unknown_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "routing_unknown_reason": "; ".join(details)})
+    else:
+        update_state({}, remove=("routing_unknown_at", "routing_unknown_reason"))
+    if verdict == "VIOLATION":
+        for m in details:
             log(f"!! 分流规则异常：{m}")
         log("!! 这会让 opencode.ai 走直连，把本机 IP 泄漏出去，且没有任何其它信号能看见。")
         log("   权威来源是 mihomo 的 /rules，不是磁盘上的 config.yaml。请人工核对。")
         update_state({"routing_bad_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                      "routing_bad_reason": "; ".join(problems)})
+                      "routing_bad_reason": "; ".join(details)})
         raise SystemExit(3)
     if state.get("routing_bad_at"):
         # 之前坏过、现在好了 —— 清掉标记，但记一条「曾异常过」的字样，
@@ -1040,7 +1155,7 @@ def show_status():
         log("泄漏检测 : 读不到 /connections（mihomo API 不通），跳过")
     elif leaks and not degraded:
         log(f"⚠ 泄漏检测 : 有 {len(leaks)} 条 {LEAK_HOST} 连接正在走 DIRECT！")
-        for h, dst in leaks[:3]:
+        for h, dst, _how in leaks[:3]:
             log(f"    {h} {dst}")
         log(f"  但降级标记为「否」、AUTOFALL={now} —— 按设计不该出现这种情况。")
         log("  最可能：config.yaml 里 opencode.ai 的分流规则被改动，"
@@ -1062,6 +1177,8 @@ def main():
     ap.add_argument("--no-heal", action="store_true", help="mihomo 挂了不自愈（调试用）")
     ap.add_argument("--clear-degraded", action="store_true",
                     help="只清降级痕迹（供 on-mihomo-up.sh 调用）")
+    ap.add_argument("--leak-count", action="store_true",
+                    help="打印当前正在走直连的 opencode.ai 连接数（供 status.sh 调用）")
     ap.add_argument("--probe-node", action="store_true",
                     help="探测当前节点连续健康（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--probes", type=int, default=2, help="--probe-node 的采样次数")
@@ -1078,11 +1195,20 @@ def main():
     # on-mihomo-up.sh 曾经自带一份硬编码的 key 列表来清状态，于是状态 schema
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
+    if args.leak_count:
+        hits = direct_leaks()
+        if hits is None:
+            print("skip"); return 1
+        print(len(hits))
+        return 0
+
     if args.probe_node:
-        ok, delay = probe_node_consecutive(args.probes, args.gap)
+        ok, delay, live = probe_node_consecutive(args.probes, args.gap)
         if ok:
-            live = api("/proxies/PROXY").get("now") or ""
-            print("%s %s" % (live, delay))
+            # 不要再调一次 /proxies/PROXY 取名字：那一跳失败会让 RESULT 变空，
+            # 于是「节点其实健康」被当成没活，白排一次复查；而若 PROXY 恰好
+            # 在这中间换掉，名字与延迟会来自两个不同节点。
+            print("%s %d" % (live, delay or 0))
         return 0                 # 无论结果如何都返回 0：钩子必须永远返回 0
 
     if args.recheck_tried:
