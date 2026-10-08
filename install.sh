@@ -573,6 +573,22 @@ def members(bl):
     return out
 
 
+def probe_pinned_to_proxy(all_lines):
+    """ip.sb 这条规则必须指向 PROXY。
+
+    逐行扫而不是正则匹配整段文本：rules 段里也有缩进注释和别的域名，
+    正则容易匹配到注释里或别处去。
+    """
+    for ln in all_lines:
+        s = ln.strip()
+        if not s.startswith("- DOMAIN-SUFFIX"):
+            continue
+        parts = [x.strip() for x in s.lstrip("- ").split(",")]
+        if len(parts) == 3 and parts[1] == "ip.sb":
+            return parts[2] == "PROXY"
+    return False
+
+
 sn = block("sniffer:", 0)
 af = block('- name: "AUTOFALL"', 2)
 if not sn or not af:
@@ -581,6 +597,12 @@ elif scalar(af, "type") != "fallback":
     print("AUTOFALL_NOT_FALLBACK")
 elif members(af) != ["PROXY", "DIRECT"]:
     print("AUTOFALL_MEMBERS=%s" % (members(af) or "(空)"))
+elif not probe_pinned_to_proxy(lines):
+    # 测量通道必须与降级链解耦。ip.sb 一旦挂回 AUTOFALL，降级时它会走直连、
+    # 返回本机自己的公网 IP；而轮次进行中（开头的降级检查只查轮次开始那一刻），
+    # 就会把这个 IP 当成「换到的新出口」写进 last_ip 并打印「完成」。
+    # 失败方向从「响亮失败」变成「静默谎报成功」，比连不上更难察觉。
+    print("PROBE_ON_AUTOFALL")
 elif scalar(sn, "enable") == "true" and scalar(sn, "parse-pure-ip") == "true":
     print("OK")
 else:
@@ -590,6 +612,7 @@ PY
 if [ "$SNIFF" = "OK" ]; then
     c_ok "  ✓ 域名嗅探能力已启用（纯 IP 建连也能命中 DOMAIN 规则）"
     c_ok "  ✓ 降级链已配置（节点全挂时退到直连，恢复后自动切回）"
+    c_ok "  ✓ 出口 IP 测量通道与降级链解耦（不会把本机 IP 误报成新出口）"
 else
     die "config.yaml 的能力校验未通过（判定=$SNIFF）。
   · WEAK                  → sniffer 段缺 enable: true 或 parse-pure-ip: true
@@ -597,6 +620,9 @@ else
   · AUTOFALL_NOT_FALLBACK → AUTOFALL 不是 fallback 组，等于没有降级
   · AUTOFALL_MEMBERS=...  → AUTOFALL 成员必须是 [PROXY, DIRECT] 且 DIRECT 在最后
                             （顺序错了会变成永远直连：fallback 取第一个健康成员）
+  · PROBE_ON_AUTOFALL     → DOMAIN-SUFFIX,ip.sb 必须指向 PROXY 而不是 AUTOFALL。
+                            挂在 AUTOFALL 上时，降级会让探测走直连返回本机 IP，
+                            而轮次进行中就会把它当成「换到的新出口」记下来。
   enhanced-mode: redir-host 下，纯 IP 建连只能靠 sniffer 从 SNI/Host 还原域名，
   否则 DOMAIN 规则静默失效、流量落到 MATCH,DIRECT —— 表现为「代理不报错但没走代理」，
   而 IP 轮换只对走 PROXY 的流量有意义，那样等于空转。

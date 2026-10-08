@@ -219,6 +219,19 @@ proxy-groups:
   #  远小于下面的 interval，所以定周期检查几乎撞不上重建窗口
   #  （3 轮真实轮换、每轮 26 秒采样 126 次，零误降级）。
   #  但 lazy 会让每个恰好落在重建窗口里的新连接都被判成节点已死而送去直连。
+  #
+  #  timeout 从默认的 5000 提到 15000 —— 这是降低误降级率**唯一**真正有效的杠杆。
+  #  【必须知道的机制边界】mihomo 的 fallback 判定是单样本布尔查表：
+  #  fallback.go 的 findAliveProxy() 顺序遍历成员、返回第一个
+  #  AliveForTestUrl()==true 的，Now() 直接调它，中间没有任何计数器、迟滞或冷却。
+  #    · max-failed-times 名字像，但只作用于 onDialFailed（拨号失败路径），
+  #      周期健康检查根本不走它 —— 照抄会得到「以为防住了其实没防住」
+  #    · fixed 钉选成员同样压不住，存活检查照样覆盖它
+  #    · relay 组已被移除；fallback-filter 是 DNS 字段，不是代理组
+  #  结论：没有任何配置开关能给 fallback 加去抖。单样本在原理上无法区分
+  #  「瞬时抖动」和「真死」，只能调阈值让抖动不够大 —— 这就是 timeout 的作用。
+  #  代价是真故障发现延迟从 interval+5 变成 interval+15 秒，
+  #  相对「持续数天」的密钥过期可以忽略。
   - name: "AUTOFALL"
     type: fallback
     proxies:
@@ -226,6 +239,7 @@ proxy-groups:
       - "DIRECT"     # 必须放最后：fallback 取第一个健康的成员
     url: "http://cp.cloudflare.com/"
     interval: 60
+    timeout: 15000
     lazy: false
 
 # --------------------------------------------------------------
@@ -236,11 +250,22 @@ proxy-groups:
 #    私钥到期时 opencode.ai 会退到直连（还能用，只是出口变回本机），
 #    而不是直接连不上。rotate.py 会在同一轮发现降级并停掉轮换定时器，
 #    详见 AUTOFALL 组的注释。
+#
+#    【ip.sb 故意挂在 PROXY 上，不跟 opencode.ai 一起走 AUTOFALL】
+#    ip.sb 是 rotate.py 唯一的出口 IP 测量通道，测量的前提是它反映的是被测对象。
+#    若它也挂在 AUTOFALL 上，降级时它会走直连、返回本机自己的公网 IP，
+#    而 rotate.py 正在轮次进行中（开头的 is_degraded() 只查轮次开始那一刻），
+#    就会把这个本机 IP 当成「换到的新出口」写进 last_ip 并打印「完成」。
+#    失败方向从「响亮失败」变成了「静默谎报成功」，比连不上更难察觉。
+#    挂在 PROXY 上之后：隧道正常时探测行为完全不变；隧道死时没有 DIRECT 退路，
+#    探测必然失败 → exit_ip() 返回 None → 走 fail_streak → 判定降级。
+#    install.sh 的能力校验会检查这一条，防止日后被顺手改回去。
 # --------------------------------------------------------------
 rules:
   # 【VPS 专属】SSH 永远直连。这是 route-exclude-address 之外的第二道保险：
   # 万一排除列表没覆盖到某条路径，这条规则仍能保住你的远程连接。
   - DST-PORT,22,DIRECT
   - DOMAIN-SUFFIX,opencode.ai,AUTOFALL
-  - DOMAIN-SUFFIX,ip.sb,AUTOFALL     # 仅供轮换脚本查出口 IP
+  # 仅供轮换脚本查出口 IP。必须挂在 PROXY 而不是 AUTOFALL，理由见上方注释。
+  - DOMAIN-SUFFIX,ip.sb,PROXY
   - MATCH,DIRECT

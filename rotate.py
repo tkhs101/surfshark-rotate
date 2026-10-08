@@ -289,6 +289,43 @@ def is_degraded():
     return autofall_now() == DEGRADED_TO
 
 
+# 停定时器前需要的连续佐证轮数。
+#
+# 【为什么不能看到 DIRECT 就停】内核的 fallback 是单样本布尔查表，没有任何迟滞
+# （见 config.yaml 里 AUTOFALL 的注释），所以隧道抖一下 AUTOFALL 就会翻到 DIRECT。
+# 实测 17 小时内翻过 2 次，其中一次让 opencode.ai 的连接用本机 IP 出去。
+# 而 mark_degraded 会 systemctl stop 掉轮换定时器，全仓库只有
+# on-mihomo-up.sh（挂在 mihomo 重启上）能把它启回来。
+# 于是一次 1~2 分钟的抖动，只要落在某个 5 分钟轮次窗口内（约 20~40% 概率），
+# 轮换就会永久停摆，除了翻 journal 没人会发现。
+#
+# 要求连续两轮都看到 DIRECT 才停，等价于要求它持续至少一个轮换周期 ——
+# 真降级（密钥到期）会持续数天，必然满足；瞬时抖动不会。
+DEGRADE_CONFIRM_ROUNDS = 2
+
+
+def check_degradation(state):
+    """返回 True 表示已确认降级、应当停掉轮换定时器。
+
+    单次看到 DIRECT 只记日志不停手 —— 本轮不做任何变更动作。
+    """
+    if not is_degraded():
+        if state.get("direct_seen"):
+            log("    内核已切回 PROXY —— 上一轮的 DIRECT 判定为瞬时抖动，不降级、不停定时器")
+            state["direct_seen"] = 0
+            save_state(state)
+        return False
+
+    seen = int(state.get("direct_seen") or 0) + 1
+    state["direct_seen"] = seen
+    save_state(state)
+    if seen < DEGRADE_CONFIRM_ROUNDS:
+        log(f"!! 内核报告节点不可用（AUTOFALL=DIRECT），第 {seen}/{DEGRADE_CONFIRM_ROUNDS} 次")
+        log("   本轮不做任何变更，也不停定时器 —— 等下一轮复核，避免瞬时抖动导致停摆")
+        return False
+    return True
+
+
 def mark_degraded(state, reason):
     """进入降级态：记状态、停掉没意义的轮换定时器、把恢复步骤打出来。
 
@@ -338,6 +375,7 @@ def clear_degraded(state):
     state.pop("degraded", None)
     state.pop("degraded_reason", None)
     state.pop("degraded_at", None)
+    state["direct_seen"] = 0
     state["fail_streak"] = 0
     save_state(state)
 
@@ -446,12 +484,18 @@ def rotate_once(dry_run=False):
 
     tier, target = pick_next(state)
 
-    # 降级检测放在最前面：本轮什么都不做就返回。
-    # 理由是降级态下切节点、热重载、探测出口 IP 全都做不出结果 ——
+    # 降级检测放在最前面。确认降级时本轮什么都不做就返回：
+    # 降级态下切节点、热重载、探测出口 IP 全都做不出结果，
     # 继续跑只是每 5 分钟空转一次，还会把降级状态冲掉。
     # 放在 current_node() 之后是因为要先确认 API 通。
-    if is_degraded():
-        return mark_degraded(state, "AUTOFALL 已选中 DIRECT（节点全挂）")
+    #
+    # 未经连续两轮佐证时（单次看到 DIRECT）同样不做任何变更动作 ——
+    # 宁可空转一轮，也不能因为一次瞬时抖动就把轮换永久停掉。
+    if check_degradation(state):
+        return mark_degraded(state, "连续两轮内核报告节点不可用（AUTOFALL=DIRECT）")
+    if state.get("direct_seen"):
+        log("--- 跳过本轮 ---")
+        return False
 
     old_ip = state.get("last_ip")
     log(f"--- 轮换开始 | 当前节点={live} | 档位={tier+1}/{len(TIERS)} "
