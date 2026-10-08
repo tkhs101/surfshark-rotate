@@ -60,10 +60,12 @@ MIXED_PORT = 7897                     # mixed-port
 MIXED_HOST = "127.0.0.1"
 IP_PROBE_HOST = "ip.sb"               # 必须在分流规则内，否则测到的是本机真实 IP
 
-# 降级链。config.yaml 里 AUTOFALL 是 fallback 组，成员 [PROXY, DIRECT]：
-# PROXY 整个不健康时它自动选中 DIRECT，节点恢复后再自动切回 PROXY。
-# 也就是说「密钥到期 → opencode.ai 连不上」这个故障被内核层面消掉了，
-# 本模块负责的是控制面：发现降级、停掉没意义的轮换、把状态告诉人。
+# 降级链。config.yaml 里 AUTOFALL 是 **select** 组，成员 [PROXY, DIRECT]，
+# 由本模块通过 PUT /proxies/AUTOFALL 显式切换 —— 内核不参与判断。
+# （早先是 fallback 组，靠内核健康检查自动翻，详见 ADR 0001 记录的
+#   废弃理由：单样本布尔裁决，隧道抖一下就把 opencode.ai 送去直连。）
+# 也就是说「密钥到期 → opencode.ai 连不上」这个故障由本模块消掉，
+# 本模块同时负责控制面：发现降级、停掉没意义的轮换、把状态告诉人。
 AUTOFALL = "AUTOFALL"
 DEGRADED_TO = "DIRECT"
 
@@ -352,10 +354,15 @@ def mark_degraded(state, reason):
     换私钥必然要 restart mihomo，钩子会在那里复查节点是否真的活了。
     """
     was = state.get("degraded")
+    # 复查计数归零：这是一次全新的降级，不该继承上一次故障用掉的配额。
+    # 否则「上次卡在 6 次上限」会让这次故障一进钩子就零次自动复查。
+    state.pop("recheck_tries", None)
     state["degraded"] = True
     state["degraded_reason"] = reason
     state["degraded_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    save_state(state)
+    update_state({"degraded": True, "degraded_reason": reason,
+                  "degraded_at": state["degraded_at"]},
+                 remove=("recheck_tries",))
 
     if was is not True:
         log("!! 进入降级态：%s" % reason)
@@ -389,17 +396,15 @@ def clear_degraded(state):
     """
     was_degraded = bool(state.get("degraded"))
     streak = int(state.get("fail_streak") or 0)
-    if not (was_degraded or streak or state.get("recovery_streak")):
+    if not has_degraded_marks(state):
         return
-    for k in ("degraded", "degraded_reason", "degraded_at",
-              "direct_seen", "recovery_streak", "recheck_tries"):
+    for k in DEGRADED_KEYS:
         state.pop(k, None)
     state["fail_streak"] = 0
-    # replace：上面 pop 掉的键必须真的消失。save_state 默认是「合并写」，
-    # 只更新显式给出的键 —— 而「删除一个键」没法用合并表达，磁盘上的
-    # degraded=true 会被读回来，看起来清了其实没清。
-    # 这是引入合并写时自己造的回归，由去抖单测抓出来。
-    save_state(state, replace=True)
+    # 增删都在 update_state 的锁内完成，且只碰列出来的键。
+    # 早先这里是 load_state + replace 写：读在锁外，而且守卫条件与
+    # clear_degraded_flags() 那份不一致，已经漂移过一次（漏 recheck_tries）。
+    update_state({"fail_streak": 0}, remove=DEGRADED_KEYS)
 
     if not was_degraded:
         log(f"    出口 IP 已恢复（此前连续 {streak} 轮取不到），轮换继续")
@@ -462,77 +467,72 @@ def heal_mihomo():
 #  状态与分档
 # ------------------------------------------------------------
 def load_state():
+    """读状态。文件缺失是正常的（首次运行），文件损坏不是 —— 要出声。
+
+    早先两者都返回一份全新的默认状态，于是损坏会被「当成没有降级」：
+    钩子守卫在明确没降级时直接 exit 0，标记一丢就再也不会把 AUTOFALL 切回
+    PROXY、也不会启回定时器 —— 而数据面还在直连，正是 ADR 里点名的静默泄漏。
+    原子写已经让「读到半个文件」不可能，所以剩下的触发面只有外部删改、
+    旧版本残留的坏文件、磁盘错误；这几种都必须看得见。
+    """
     try:
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
-    except Exception:
+    except FileNotFoundError:
+        return {"tier": 0, "idx": 0, "last_ip": None}
+    except Exception as e:
+        log(f"!! 状态文件损坏（{type(e).__name__}: {e}）—— 按「没有状态」处理")
+        log("   如果此刻明明是降级态，轮换不会再自动恢复，请手工确认：")
+        log("   sudo python3 %s --status" % os.path.join(BASE, "rotate.py"))
         return {"tier": 0, "idx": 0, "last_ip": None}
 
 
-def save_state(s, replace=False):
-    """原子写 + 加锁。
+def update_state(patch=None, remove=(), incr=None):
+    """在同一个锁内完成「读 -> 改 -> 写」，并返回磁盘上的最终状态。
 
-    【为什么不能直接 open(w)】状态文件有两个写入方：rotate.py 和
-    on-mihomo-up.sh。直接 open(...,"w") 会先把文件截断再逐块写，中途崩溃或
-    被并发写覆盖，文件就成了一段残缺的 JSON。而 load_state() 会吞掉所有解析
-    异常并返回一份全新的默认状态 —— 于是 degraded 标记凭空消失、定时器早已
-    被停掉、而数据面上 opencode.ai 还在用本机 IP 出网，没有任何东西会再去看
-    它一眼。残缺写入正是把这种静默泄漏变成真实事件的触发器。
+    【为什么是独立原语】读-改-写必须整体在同一个锁内，
+    中间任何一步都可能踩进另一个写入方。而且更隐蔽的是：调用方通常传的是
+    load_state() 拿到的**整份快照**，于是「合并写」会把这份快照里所有键都盖回
+    磁盘 —— 包括调用方这一轮根本没打算动、但已经过时的那些。实测过一个**无并发**
+    也会发生的例子：钩子刚用 replace=True 删掉 degraded，rotate.py 随后拿陈旧
+    快照写回 recovery_streak，顺手把 degraded=true 又带回来了；而钩子此时已经
+    启回了定时器、切回了 PROXY，状态却显示降级 —— 轮换静默停摆。
 
-    两道防线：
-      · os.replace 是同一文件系统内的原子改名，读者要么看到旧内容要么看到新
-        内容，不存在读到半个文件的情况。
-      · flock 让读-改-写整段串行化，避免两个写入方互相覆盖对方刚写的字段。
-
-    默认是「合并写」：只把 s 里显式给出的键写下去，其余沿用文件现值 ——
-    这样「只改一个字段」是安全操作，不会把别的写入方刚写的东西抹掉。
-
-    replace=True 则是「整体覆盖」，语义上不同：它必须用来表达**删除**。
-    合并写表达不了删除 —— 从 s 里 pop 掉 degraded 之后，合并会把磁盘上
-    那个 degraded=True 又读回来，看起来像清掉了，实际没清。
+    patch 只写它列出的键，remove 只删它列出的键，两者都不碰其余字段。
     """
-    if not os.path.exists("/run/systemd/system") or fcntl is None:
-        _save_state_plain(s, replace)
-        return
+    def _apply():
+        cur = load_state()
+        if not isinstance(cur, dict):
+            cur = {}
+        for k in remove:
+            cur.pop(k, None)
+        if patch:
+            cur.update(patch)
+        for k, step in (incr or {}).items():
+            cur[k] = int(cur.get(k) or 0) + step
+        return cur
+
+    if fcntl is None:
+        final = _apply()
+        _write_atomic(final)
+        return final
     lock_path = STATE_FILE + ".lock"
     try:
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError:
-        _save_state_plain(s, replace)
-        return
+        final = _apply()
+        _write_atomic(final)
+        return final
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
-            if not replace:
-                s = _merge_locked(s)
+            final = _apply()
+            _write_atomic(final)      # 同样必须在临界区内
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
-        _write_atomic(s)
     finally:
         os.close(fd)
-
-
-def _save_state_plain(s, replace=False):
-    # 注意必须接住返回值 —— _merge_locked 不改原字典，只返回合并结果。
-    _write_atomic(s if replace else _merge_locked(s))
-
-
-def _merge_locked(s):
-    """把 s 合并进文件里的现状，避免覆盖别人刚写的字段。
-
-    调用方已持有锁。s 里显式给出的键优先（那是它这一轮真正改动的东西），
-    其余键沿用文件里的现值 —— 这让「只改一个字段」成为安全操作。
-    """
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            cur = json.load(f)
-        if isinstance(cur, dict):
-            merged = dict(cur)
-            merged.update(s)
-            return merged
-    except Exception:
-        pass
-    return dict(s) if isinstance(s, dict) else s
+    return final
 
 
 def _write_atomic(s):
@@ -543,6 +543,19 @@ def _write_atomic(s):
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, STATE_FILE)
+        # 【必须 fsync 父目录】os.replace 的持久性靠的是父目录项落盘，
+        # 只 fsync 文件不够：断电后改名可能回退，读者会看到旧内容。
+        # 而在这个项目里「旧内容」恰好是最坏的内容 —— mark_degraded 写完
+        # degraded=true、紧接着 systemctl stop 定时器之后掉电且改名回退，
+        # 就是「标记丢失 + AUTOFALL 已是 DIRECT + 定时器已停」的静默泄漏。
+        try:
+            dfd = os.open(os.path.dirname(STATE_FILE) or ".", os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass          # 某些文件系统不支持目录 fsync，不影响原子改名本身
     except OSError as e:
         log(f"    状态文件写入失败：{e}")
         try:
@@ -551,24 +564,32 @@ def _write_atomic(s):
             pass
 
 
+# 「降级痕迹」是哪些键，和「清理时删掉哪些键」是同一件事 ——
+# 所以只维护一份。早先两处各写一份 for k in (...) 列表，守卫条件又各写一份，
+# 结果已经漂移过一次：只有 recheck_tries 时，clear_degraded 守卫早退而
+# clear_degraded_flags 却清了。两份列表漂移至少还 grep 得到，守卫漂移查不出来。
+DEGRADED_KEYS = ("degraded", "degraded_reason", "degraded_at",
+                 "direct_seen", "recovery_streak", "recheck_tries")
+
+
+def has_degraded_marks(s):
+    return any(s.get(k) for k in DEGRADED_KEYS) or bool(s.get("fail_streak"))
+
+
 def clear_degraded_flags():
-    """清掉降级痕迹，只改这几个键，不碰 tier/idx/last_ip。
+    """清掉全部降级痕迹，只动这批键，不碰 tier/idx/last_ip。
 
     on-mihomo-up.sh 通过 `rotate.py --clear-degraded` 调用它，而不是自己
-    再写一份 key 列表 —— 两个写入方各带一份硬编码列表，迟早会漏掉某个键，
+    再写一份 key 列表 —— 两个写入方各带一份硬编码清单，迟早会漏掉某个键，
     而漏掉的恰恰是「标记已恢复」这一类语义最重的键。
+
+    增删都走 update_state：读-改-写在同一个锁内，且只碰列出来的键。
+    早先这里是 load_state + replace 写，读在锁外；而且守卫条件与
+    clear_degraded() 的那份不一致，已经漂移过一次。
     """
-    s = load_state()
-    if not (s.get("degraded") or s.get("fail_streak")
-            or s.get("recovery_streak") or s.get("recheck_tries")):
+    if not has_degraded_marks(load_state()):
         return False
-    # 这份清单必须与 clear_degraded() 的那份保持一致 —— 两处都在清同一批键，
-    # 少一个就意味着那个键在某些恢复路径上清不掉。
-    for k in ("degraded", "degraded_reason", "degraded_at",
-              "direct_seen", "recovery_streak", "recheck_tries"):
-        s.pop(k, None)
-    s["fail_streak"] = 0
-    save_state(s, replace=True)   # replace：pop 掉的键必须真的消失
+    update_state({"fail_streak": 0}, remove=DEGRADED_KEYS)
     return True
 
 
@@ -576,22 +597,20 @@ def bump_recheck_tries():
     """复查计数 +1，返回新值。给 on-mihomo-up.sh 用。
 
     计数同样归本模块所有：钩子里再手写一份读-改-写，就得重复原子写与加锁的
-    逻辑，重复一次就多一个能把它写坏的版本。
+    逻辑，重复一次就多一个能把它写坏的版本。增也在锁内完成 —— 读加写分开
+    的话，两个并发调用会拿到同一个新值。
     """
-    s = load_state()
-    n = int(s.get("recheck_tries") or 0) + 1
-    s["recheck_tries"] = n
-    save_state(s)
-    return n
+    return int(update_state(incr={"recheck_tries": 1}).get("recheck_tries") or 0)
 
 
 def reset_recheck_tries():
-    """复查计数归零。恢复路径调用。"""
-    s = load_state()
-    if not s.get("recheck_tries"):
-        return
-    s["recheck_tries"] = 0
-    save_state(s, replace=True)
+    """复查计数归零。人工重试前调用。
+
+    这里是一次纯 setter（只把 recheck_tries 置 0，没有任何删除），
+    早先却用了 replace=True 整体覆盖 —— 别人刚写的 last_ip 会被整块盖回旧值。
+    合并写同样能把一个键置 0，且保留其余字段。
+    """
+    update_state({"recheck_tries": 0})
 
 
 def pick_next(state):
@@ -648,7 +667,7 @@ def rotate_once(dry_run=False):
         if node_healthy(live):
             rec += 1
             state["recovery_streak"] = rec
-            save_state(state)
+            update_state({"recovery_streak": rec})   # 补丁，不是整份快照
             if rec < RECOVER_AFTER_HEALTHY:
                 log(f"    控制面探测健康，第 {rec}/{RECOVER_AFTER_HEALTHY} 次 —— "
                     f"再确认一次才撤销降级")
@@ -660,7 +679,7 @@ def rotate_once(dry_run=False):
             log("--- 本轮不做轮换，让下一轮重新建立基线 ---")
         else:
             state["recovery_streak"] = 0
-            save_state(state)
+            update_state({"recovery_streak": 0})
             log("    节点仍不可用（控制面探测失败），维持降级")
         return False
 
@@ -754,13 +773,13 @@ def rotate_once(dry_run=False):
                 log(f"    控制面判定节点仍可用 —— 隧道没坏，是探测通道（ip.sb）的问题，不降级")
                 log(f"    fail_streak 清零，last_ip 保留为 {old_ip or '(未知)'}")
                 state["fail_streak"] = 0
-                save_state(state)
+                update_state({"fail_streak": 0, "last_ip": old_ip})
                 log(f"--- 结束 | 节点={target} | 出口IP=(取不到，但隧道健康) | "
                     f"未降级 ---")
                 return False
             return mark_degraded(state, f"连续 {streak} 轮取不到出口 IP，且控制面也探测不到节点")
 
-        save_state(state)
+        update_state({"fail_streak": streak, "last_ip": old_ip})
         log(f"--- 结束 | 节点={target} | 出口IP=(取不到) | "
             f"连续失败 {streak}/{DEGRADE_AFTER_FAILS} ---")
         return False
@@ -783,7 +802,7 @@ def rotate_once(dry_run=False):
             log(f"    备用档成功 → 升回第 {state['tier']+1} 档")
 
     state["last_ip"] = new_ip
-    save_state(state)
+    update_state({"last_ip": new_ip, "idx": state["idx"], "tier": state["tier"]})
     log(f"--- 完成 | 节点={target} | IP={new_ip} | 档位={state['tier']+1} ---")
     return True
 

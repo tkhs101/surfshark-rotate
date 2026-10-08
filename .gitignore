@@ -12,6 +12,9 @@ mihomo.new
 
 # 运行状态与日志
 .rotate_state.json
+# 状态写入过程产生的临时产物：.lock 是 flock 的载体，.tmp 是原子写的中间态
+.rotate_state.json.lock
+.rotate_state.json.tmp
 rotate.log
 
 # 配置备份（万一有人把生成出来的、含私钥的配置拷进仓库）

@@ -12,8 +12,8 @@
 #  【和谁配合】
 #  · rotate.py 检测到节点全挂时，会 systemctl stop surfshark-rotate.timer
 #    并在 .rotate_state.json 里写 degraded=true（详见 rotate.py 的 mark_degraded）
-#  · mihomo 侧的 AUTOFALL（fallback 组）会在节点恢复后自动切回 PROXY，
-#    但那只是数据面 —— 没人把定时器启回来，轮换不会自己复活。
+# 由 rotate.py 在连续 2 次控制面探测健康后切回 PROXY —— 恢复判据走控制面，
+# 不看 AUTOFALL 当前指向谁（那正是我们自己设的，用它判断会自证循环）。
 #    本脚本补的就是这一环。
 #
 #  设计原则：永远返回 0。
@@ -60,6 +60,18 @@ say() { printf '[on-mihomo-up] %s\n' "$*"; }
 #   2 = 状态文件读不出来 -> 继续往下走，改用数据面判断
 # 早先写成 `"$PY3" -c ... && exit 0`，把语义整个反转了：已降级反而立刻退出，
 # 于是恢复路径完全失灵 —— 而降级路径不受影响，只测降级根本发现不了。
+# --resume 表示这是**链式复查**自己调起来的；不带参数则是人工/开机触发的首次。
+#
+# 必须区分：链式复查每次都重新执行本脚本，若每次都归零计数，上限就永远触发不了，
+# 于是又变回无限重排。而人工重试必须归零 —— 早先的提示语写「restart mihomo
+# （计数重置）」是错的：除了真的恢复，没有任何地方会清这个计数，
+# 它能一直停在上限值上，于是人工重试照样一次都不查。
+RESUMED=0
+[ "${1:-}" = "--resume" ] && RESUMED=1
+if [ "$RESUMED" = "0" ]; then
+    "$PY3" "$BASE/rotate.py" --reset-recheck >/dev/null 2>&1
+fi
+
 STATE_UNKNOWN=0
 if [ -f "$STATE" ]; then
     "$PY3" -c 'import json,sys
@@ -81,7 +93,10 @@ if [ "$STATE_UNKNOWN" = "1" ]; then
 fi
 
 [ -r "$CFG" ] || exit 0
-SECRET="$(sed -n 's/^secret:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CFG" 2>/dev/null | head -1)"
+# 必须容忍 secret: 前的缩进 —— rotate.py 与 install.sh 的解析都容忍，
+# 而这里不容忍。三处不一致的后果是 config 里缩进一格就同时废掉
+# 「钩子恢复」与「降级横幅」，变成永久泄漏且没有任何信号。
+SECRET="$(sed -n 's/^[[:space:]]*secret:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CFG" 2>/dev/null | head -1)"
 case "$SECRET" in
     ""|*@*) exit 0 ;;
 esac
@@ -118,7 +133,7 @@ HEALTH_GAP=8
 RESULT="$("$PY3" - "$HEALTH_PROBES" "$HEALTH_GAP" <<'PY' 2>/dev/null
 import json, re, sys, time, urllib.parse, urllib.request
 cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
-sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
+sec = re.search(r'(?m)^\s*secret:\s*"?([^"#\s]+)"?\s*$', cfg)
 if not sec:
     sys.exit(0)
 H = {"Authorization": "Bearer " + sec.group(1)}
@@ -185,23 +200,44 @@ except Exception:
     if [ "$NEXT" -gt "$RECHECK_MAX" ]; then
         say "已复查 $TRIES 次仍未恢复，停止自动复查（不会有人来修的）"
         say "  现在是降级态：opencode.ai 走直连还能用，但出口是本机 IP，轮换已停摆。"
-        say "  修好之后二选一：sudo systemctl restart mihomo（计数重置，重新自动复查）"
+        say "  修好之后二选一（两者都会把复查计数归零、重新开始自动复查）："
+        say "            sudo systemctl restart mihomo"
         say "            或直接 sudo systemctl start $TIMER"
         exit 0
     fi
 
     say "控制面探测节点失败，${RECHECK_DELAY}s 后复查（第 $NEXT/$RECHECK_MAX 次）"
-    # 计数由 rotate.py 落盘：它走 flock + 原子写，是状态 schema 的唯一 owner。
-    # 钩子里再手写一份读-改-写，就多一个能把它写坏的版本 —— 实测手写那份
-    # 确实没写进去，而计数没落盘会让上限永远不生效。
-    GOT="$("$PY3" "$BASE/rotate.py" --recheck-tried 2>/dev/null || echo "$NEXT")"
-    [ "$GOT" = "$NEXT" ] || say "⚠ 复查计数写入异常（期望 $NEXT，实得 $GOT）"
-
+    # 先排复查，成功了才记这一跳。
+    #
+    # 【单元名必须每跳唯一】早先固定用 --unit=surfshark-rotate-resume。
+    # systemd 的 --on-active 会建**两个**瞬态单元（.timer 与 .service），
+    # 而第 2 跳的进程本身就是 surfshark-rotate-resume.service、此刻正在运行，
+    # 再申请同名直接失败。实测：第 1 跳 rc=0，第 2 跳报
+    # 「Unit surfshark-rotate-resume.timer was already loaded」、rc=1。
+    # 于是复查链只能走一跳，RECHECK_MAX 从第二跳起就是装饰。
+    #
+    # 计数放在排成功之后：排不上就说明这一跳根本没发生，记它等于白烧配额。
     if command -v systemd-run >/dev/null; then
-        systemd-run --quiet --unit=surfshark-rotate-resume \
-            --on-active="${RECHECK_DELAY}" \
-            /bin/bash "$BASE/on-mihomo-up.sh" >/dev/null 2>&1 \
-            || say "复查起不来，等下次 mihomo 重启或手工 systemctl start $TIMER"
+        if ! systemd-run --quiet --collect \
+                --unit="surfshark-rotate-resume-$NEXT" \
+                --on-active="${RECHECK_DELAY}" \
+                /bin/bash "$BASE/on-mihomo-up.sh" --resume \
+                >/dev/null 2>&1; then
+            say "复查排不起来（同名单元未释放或 systemd 拒绝），停止自动复查"
+            say "  修好之后请手工重试：sudo systemctl restart mihomo"
+            exit 0
+        fi
+        # 计数由 rotate.py 落盘：它走 flock + 原子写，是状态 schema 的唯一 owner。
+        # 钩子里再手写一份读-改-写，就多一个能把它写坏的版本。
+        GOT="$("$PY3" "$BASE/rotate.py" --recheck-tried 2>/dev/null)"
+        # 这里**不能**写 || echo "$NEXT" —— 那会让 GOT 恒等于 NEXT，于是
+        # 「写失败」的告警永远不触发；而写失败恰恰意味着上限永不生效
+        # （rotate.py 坏掉时必然发生），也就正是最需要上限的时候。
+        if [ "$GOT" != "$NEXT" ]; then
+            say "⚠ 复查计数未能落盘（期望 $NEXT，实得 '${GOT:-空}'）—— 上限将失效，停止自动复查"
+            say "  原因通常是 rotate.py 不可用。修好之后手工重试：sudo systemctl restart mihomo"
+            exit 0
+        fi
     else
         say "systemd-run 不可用，请手工执行 systemctl start $TIMER"
     fi
@@ -210,11 +246,6 @@ fi
 
 # ---- 已恢复：切回代理、启回定时器并清标记 ----
 if systemctl start "$TIMER" 2>/dev/null; then
-    # 降级痕迹交给 rotate.py 清，不在这里再写一份 key 列表 ——
-    # 两个写入方各维护一份清单，迟早会漏掉某个键，而漏掉的恰恰是
-    # 「标记已恢复」这类语义最重的键。顺带把复查计数一并归零。
-    "$PY3" "$BASE/rotate.py" --clear-degraded >/dev/null 2>&1
-
     # 顺手把 AUTOFALL 切回 PROXY。降级时是我们自己把它设成 DIRECT 的，
     # 光清状态不够 —— 否则要等到下一轮轮换（最多 5 分钟）才纠正回来，
     # 这段时间 opencode.ai 仍在用本机 IP 出网，正是这个项目要避免的事。
@@ -224,7 +255,7 @@ if systemctl start "$TIMER" 2>/dev/null; then
     if "$PY3" - <<'PYHOOK' 2>/dev/null
 import json, re, sys, urllib.request
 cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
-sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
+sec = re.search(r'(?m)^\s*secret:\s*"?([^"#\s]+)"?\s*$', cfg)
 if not sec:
     sys.exit(1)
 req = urllib.request.Request(
@@ -236,12 +267,25 @@ urllib.request.urlopen(req, timeout=10).read()
 sys.exit(0)
 PYHOOK
     then
-        say "节点已恢复（$NODE_ALIVE 连续 2 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
-        say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
+        # 顺序要紧：先确认路由真的切回来了，才清降级标记。
+        # 反过来的话 PUT 失败时标记已经被销毁，钩子下次启动会在「明确未降级」
+        # 分支直接 exit 0，再也不会重试这一步 —— 钩子把自己的补救机会先烧掉了。
+        #
+        # 降级痕迹交给 rotate.py 清，不在这里再写一份 key 列表。
+        if "$PY3" "$BASE/rotate.py" --clear-degraded >/dev/null 2>&1; then
+            say "节点已恢复（$NODE_ALIVE 连续 $HEALTH_PROBES 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+            say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
+        else
+            say "节点已恢复（$NODE_ALIVE 连续 $HEALTH_PROBES 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+            say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
+            say "⚠ 降级标记未能清除（状态文件仍显示降级）。下一轮轮换会重试；"
+            say "  若一直不好请手工执行：sudo python3 $BASE/rotate.py --clear-degraded"
+        fi
     else
-        say "节点已恢复（$NODE_ALIVE 连续 2 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+        say "节点已恢复（$NODE_ALIVE 连续 $HEALTH_PROBES 次探测健康，延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
         say "⚠ AUTOFALL 未能切回 PROXY —— opencode.ai 可能仍在直连，请手工确认："
         say "  sudo python3 $BASE/rotate.py --status"
+        say "  降级标记已保留，下次 mihomo 重启时钩子会再试这一步"
     fi
 else
     say "启用 $TIMER 失败，请手工执行：systemctl start $TIMER"

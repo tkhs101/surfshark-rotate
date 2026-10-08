@@ -22,7 +22,10 @@ fi
 #  必须在所有其它检查之前打：降级时下面的「分流验证」会给出误导性的结论
 #  （代理出口 == 直连出口），先看到横幅才不会照着错误方向去排查。
 # ------------------------------------------------------------
-BASE_SECRET="$(sed -n 's/^secret:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CFG" 2>/dev/null | head -1)"
+# 必须容忍 secret: 前的缩进 —— rotate.py 与 install.sh 的解析都容忍，
+# 而这里不容忍。三处不一致的后果是 config 里缩进一格就同时废掉
+# 「钩子恢复」与「降级横幅」，变成永久泄漏且没有任何信号。
+BASE_SECRET="$(sed -n 's/^[[:space:]]*secret:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CFG" 2>/dev/null | head -1)"
 AF_NOW=""
 if [ -n "$BASE_SECRET" ]; then
     AF_NOW="$(curl -fsS --max-time 5 -H "Authorization: Bearer $BASE_SECRET" \
