@@ -73,7 +73,7 @@ STATE_UNKNOWN=0
 if [ -f "$STATE" ]; then
     "$PY3" -c 'import json,sys
 try:
-    sys.exit(0 if json.load(open(sys.argv[1])).get("degraded") else 1)
+    sys.exit(0 if json.load(open(sys.argv[1], encoding="utf-8")).get("degraded") else 1)
 except Exception:
     sys.exit(2)' "$STATE" 2>/dev/null
     case "$?" in
@@ -173,7 +173,7 @@ if [ -z "$NODE_ALIVE" ]; then
 import json, sys, os
 p = sys.argv[1]
 try:
-    print(int(json.load(open(p)).get("recheck_tries") or 0))
+    print(int(json.load(open(p, encoding="utf-8")).get("recheck_tries") or 0))
 except Exception:
     print(0)' "$STATE" 2>/dev/null || echo 0)"
     NEXT=$((TRIES + 1))
@@ -201,7 +201,7 @@ except Exception:
     #
     # 计数放在排成功之后：排不上就说明这一跳根本没发生，记它等于白烧配额。
     if command -v systemd-run >/dev/null; then
-# 排之前先看有没有**别的**复查链在飞。
+        # 排之前先看有没有**别的**复查链在飞。
         #
         # mihomo 崩溃循环时（Restart=always + RestartSec=5s），每一次人工重启
         # 都会在本文件开头把计数清零，于是反复申请同一个 --unit=...-1；
@@ -210,9 +210,26 @@ except Exception:
         # 而提示还让人再做一遍同样的操作 —— 那是自己制造自己。
         #
         # 有在飞的链恰恰说明链还活着，此时正确做法是什么都不做。
+        #
+        # 【必须按状态过滤，这不是洁癖】list-units --all 列的是**所有已装载
+        # 单元**。而 oneshot timer 一触发就回到 inactive：我们这一跳运行时，
+        # 它的父 timer surfshark-rotate-resume-N.timer 正是那个「刚触发完、
+        # 还没被 GC 回收」的单元。把它算成「有别的链在飞」，
+        # 每一跳都会因为看见自己而拒绝重排 —— 实测复查链在第 2 跳就终止，
+        # RECHECK_MAX 从此再也不会触发，而提示还谎称「已有一条链在飞」。
+        #
+        # 只认 active：正在等下一跳的链才会挡住本次重排。
+        # inactive 的不挡（自己的父 timer、已触发完的旧链）；
+        # failed 的不挡（要 reset-failed 才卸载，一个残留会让复查永久无法重排）。
+        #
+        # --collect 救不了：它是 --property=CollectMode=inactive-or-failed 的
+        # 快捷方式，落在瞬态 **service** 上，而我们 glob 的是 **timer** ——
+        # 它并没有被设上 CollectMode，只能等 GC，而 GC 对刚被引用过的单元
+        # 有回收宽限窗口。父 timer 刚被 job 引用完，正好落在窗口里。
         INFLIGHT=""
         if command -v systemctl >/dev/null; then
-            INFLIGHT="$(systemctl list-units --all --no-legend --plain \
+            INFLIGHT="$(systemctl list-units --type=timer --state=active \
+                        --no-legend --plain \
                         'surfshark-rotate-resume-*.timer' 2>/dev/null \
                         | awk '{print $1}' | head -3)"
         fi

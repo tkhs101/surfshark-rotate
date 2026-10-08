@@ -844,11 +844,48 @@ class TestNoMaterialisation(RotateTestBase):
         self.assertEqual(pathlib.Path(self.rotate.STATE_FILE).read_text(encoding="utf-8"),
                          raw, "损坏文件是唯一证据，不能被任何子命令覆盖")
 
-    def test_patch_still_creates_file_when_allowed(self):
-        """守卫不能连正常的首次写入也拦掉。"""
+    def test_default_does_not_create_file(self):
+        """默认**不**物化 —— 物化必须显式申请。
+
+        这是「谁有资格物化状态文件」改成策略之后的锁：
+        update_state 在没有 require_existing=False 时，永远不会创建状态文件。
+        """
         self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
         self.rotate.update_state({"tier": 0, "last_ip": "1.1.1.1"})
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists(),
+                         "默认策略已改为不物化")
+
+    def test_explicit_authorisation_still_creates_file(self):
+        """显式授权仍然能创建 —— 否则全新安装的轮换状态无处落盘。"""
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+        self.rotate.update_state({"tier": 0, "last_ip": "1.1.1.1"},
+                                 require_existing=False)
         self.assertTrue(pathlib.Path(self.rotate.STATE_FILE).exists())
+
+    def test_observation_accounting_never_materialises(self):
+        """分流核对的记账是观测，不是轮换证据 —— 一律不许物化。
+
+        这正是上一个 P0 的残余：物化点从 --dry-run 挪到了核对的第一笔记账，
+        而它排在切换/重载/验 IP 之前，于是任何一次中途失败的轮换都会留下
+        一份空壳，而闸门把它当成权威。
+        """
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+        self.rotate.update_state({"routing_bad_at": "2026-01-01 00:00:00",
+                                  "routing_bad_reason": "x"})
+        self.rotate.update_state({}, remove=("routing_unknown_at",))
+        self.rotate.update_state({"routing_unknown_at": "t",
+                                  "routing_unknown_reason": "y"})
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists(),
+                         "观测性记账不得物化")
+
+    def test_only_two_call_sites_authorised(self):
+        """锁住「只有轮换记账那两处有资格物化」这个不变量。"""
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        code = chr(10).join(l for l in src.split(chr(10))
+                            if not l.strip().startswith("#"))
+        # 去掉注释里的那一处
+        n = code.count("require_existing=False")
+        self.assertEqual(n, 2, "授权点必须恰好两个：fail_streak 首记 + 主记账")
 
     def test_recovery_actually_removes_keys(self):
         """置空串会让「曾经坏过」看起来像从未发生 —— 必须真删。"""
@@ -881,11 +918,12 @@ class TestDryRunWritesNothing(RotateTestBase):
                 x["proxy"] = "DIRECT"
         buf = io.StringIO(); old = sys.stdout; sys.stdout = buf
         try:
-            self.rotate.rotate_once(dry_run=True)
+            with self.assertRaises(SystemExit) as cm:
+                self.rotate.rotate_once(dry_run=True)
         finally:
             sys.stdout = old
-        self.assertIn("VIOLATION", buf.getvalue(),
-                      "dry-run 仍要如实报告核对结论")
+        self.assertEqual(cm.exception.code, 3,
+                         "dry-run 遇到确认违规也要退出 3 —— install.sh 靠它阻断安装")
 
 
 class TestLeakCountContract(RotateTestBase):

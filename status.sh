@@ -44,7 +44,7 @@ if [ -n "$PY3" ] && [ -f "$STATE" ]; then
     DEG_AT="$("$PY3" -c '
 import json, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
     print(d.get("degraded_at") or "")
 except Exception:
     print("")' "$STATE" 2>/dev/null)"
@@ -109,7 +109,7 @@ if [ -n "$PY3" ] && [ -f "$STATE" ]; then
     DEG_FLAG="$("$PY3" -c '
 import json, sys
 try:
-    print("true" if json.load(open(sys.argv[1])).get("degraded") else "false")
+    print("true" if json.load(open(sys.argv[1], encoding="utf-8")).get("degraded") else "false")
 except Exception:
     print("")' "$STATE" 2>/dev/null)"
 fi
@@ -132,7 +132,7 @@ if [ -n "$PY3" ] && [ -f "$STATE" ]; then
     ROUTE_BAD="$("$PY3" -c '
 import json, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     raise SystemExit
 if d.get("routing_bad_at"):
@@ -144,7 +144,7 @@ if [ -n "$PY3" ] && [ -f "$STATE" ]; then
     ROUTE_UNK="$("$PY3" -c '
 import json, sys
 try:
-    d = json.load(open(sys.argv[1]))
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
 except Exception:
     raise SystemExit
 if d.get("routing_unknown_at"):

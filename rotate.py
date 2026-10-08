@@ -752,8 +752,22 @@ def load_state():
         return {"tier": 0, "idx": 0, "last_ip": None}
 
 
-def update_state(patch=None, remove=(), incr=None, require_existing=False):
+def update_state(patch=None, remove=(), incr=None, require_existing=True):
     """在同一个锁内完成「读 -> 改 -> 写」，并返回磁盘上的最终状态。
+
+    【谁有资格物化状态文件】默认 True（不物化），物化必须**显式申请**。
+    理由是一条被反复复现的不变量：钩子闸门只看「文件在不在」和
+    「有没有 degraded 键」，而一份凭空物化出来的文件**两者都满足** ——
+    于是被判成「明确未降级」直接 exit 0，「状态丢失 -> 自修」永久失效，
+    AUTOFALL 停在 DIRECT 不动。
+    物化点是「本轮真的轮换过了」的那两笔记账（fail_streak 首次累加、成功记账）。
+    观测性记账（分流核对）一律不物化 —— 那不是轮换的证据。
+
+    曾经默认 False：结果分流核对的第一笔记账会先把文件造出来，
+    而它排在切换/重载/验 IP 之前 —— 于是任何一次中途失败的轮换
+    （切换失败、重载失败、进程被杀）都会留下一份空壳
+    {"tier":0,"idx":0,"last_ip":null}，而闸门照旧把它当成权威。
+    守卫加了两次都没堵住，因为物化点一直在移动 —— 这次从**策略**上关掉它。
 
     【为什么是独立原语】读-改-写必须整体在同一个锁内，
     中间任何一步都可能踩进另一个写入方。而且更隐蔽的是：调用方通常传的是
@@ -953,6 +967,23 @@ def rotate_once(dry_run=False):
     #
     # 恢复后不立刻做本轮轮换：刚恢复的节点可能还不稳，此刻重建隧道
     # 等于用一个说不清的 IP 去记基线。干净退出，让下一轮正常轮换去建立基线。
+    # 【降级分支之前先核对一次】降级分支会 return，而它原本排在切换节点之后，
+    # 于是「降级中 + 规则坏」这一组合永远不核对 —— 实测：降级态下节点一恢复，
+    # clear_degraded() 把 AUTOFALL 切回 PROXY、清掉 degraded，然后直接 return，
+    # status.sh 一片绿，而规则仍确认指向 DIRECT。要等下一次轮换（5 分钟）才补上，
+    # 而窗口起点恰恰是「恢复成功」这个最让人放松的时刻。
+    #
+    # 这里只拦 VIOLATION；UNKNOWN 一律放过 —— 降级分支要靠 node_healthy()
+    # 探活来恢复，被「读不到 /rules」拦住就永远恢复不了，那比多等一轮核对糟得多。
+    _v, _d = check_routing_invariants()
+    if _v == "VIOLATION":
+        for m in _d:
+            log(f"!! 分流规则异常：{m}")
+        log("!! 这会让 opencode.ai 走直连，把本机 IP 泄漏出去，而没有任何其它信号能看见。")
+        update_state({"routing_bad_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "routing_bad_reason": "; ".join(_d)})
+        raise SystemExit(3)
+
     if state.get("degraded"):
         # 同样要求连续 RECOVER_AFTER_HEALTHY 次健康，与降级侧对称。
         # 单次侥幸成功不足以证明「真的修好了」—— 那次成功的对象是
@@ -1122,7 +1153,11 @@ def rotate_once(dry_run=False):
                 return False
             return mark_degraded(state, f"连续 {streak} 轮取不到出口 IP，且控制面也探测不到节点")
 
-        update_state({"fail_streak": streak, "last_ip": old_ip})
+        # 显式授权物化：这是**轮换记账**。全新机器上节点不通时的第一笔 ——
+        # 实测不加 require_existing=False 的话 fail_streak 永不累加，
+        # mark_degraded 永远到不了，节点全挂时永远不降级。
+        update_state({"fail_streak": streak, "last_ip": old_ip},
+                     require_existing=False)
         log(f"--- 结束 | 节点={target} | 出口IP=(取不到) | "
             f"连续失败 {streak}/{DEGRADE_AFTER_FAILS} ---")
         return False
@@ -1155,9 +1190,11 @@ def rotate_once(dry_run=False):
             log(f"    备用档成功 → 升回第 {state['tier']+1} 档")
 
     state["last_ip"] = new_ip
+    # 显式授权物化：主记账点，全新安装首轮的轮换状态靠它落盘。
     update_state({"last_ip": new_ip, "idx": state["idx"],
                   "tier": state["tier"],
-                  "same_ip_streak": state.get("same_ip_streak", 0)})
+                  "same_ip_streak": state.get("same_ip_streak", 0)},
+                 require_existing=False)
     log(f"--- 完成 | 节点={target} | IP={new_ip} | 档位={state['tier']+1} ---")
     return True
 
