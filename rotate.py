@@ -1352,7 +1352,14 @@ def main():
         # 落进 *) 被当成**泄漏条数**：mihomo API 一挂，页面就喊正在泄漏。
         # 正是上一轮刚消灭的「零证据说泄漏」从另一扇门回来了。
         hits = direct_leaks()
-        print("skip" if hits is None else len(hits))
+        if hits is None:
+            print("skip")
+        else:
+            # 契约仍是「十进制非负整数或 skip」，但**附带**一个可用性标记：
+            # status.sh 走 --leak-count，早先那条绿字完全不披露
+            # 「按 IP 反查可能不可用」—— 而 sniffer 失效正是这条检测要覆盖的场景。
+            # 在检测器半盲时给绿字，与我们刚修掉的「假全绿」是同一类。
+            print("%d %s" % (len(hits), "ok" if _leak_ip_lookup_ok() else "noip"))
         return 0
 
     if args.probe_node:

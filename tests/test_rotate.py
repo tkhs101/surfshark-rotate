@@ -955,18 +955,24 @@ class TestLeakCountContract(RotateTestBase):
                         if not l.strip().startswith("#"))
         self.assertIn("return 0", blk, "判据失效也必须 exit 0")
         self.assertNotIn("return 1", blk, "契约不得用退出码承载")
-        self.assertIn('"skip" if hits is None', blk)
+        self.assertIn('print("skip")', blk)
+        self.assertIn("_leak_ip_lookup_ok()", blk,
+                      "判据失效时也必须报 skip，且带可用性标记")
 
     def test_consumer_treats_non_numeric_as_skip(self):
         """消费端必须把任何非纯数字归为「读不到」，而不是条数。"""
         t = (ROOT / "status.sh").read_text(encoding="utf-8")
         self.assertNotIn("--leak-count 2>/dev/null || echo skip", t,
                          "`|| echo skip` 会把 echo 的输出也收进变量")
-        i = t.index('case "$LEAK_RAW" in')
-        seg = t[i:t.index("esac", i)]
+        i = t.index('LEAK_RAW="$("$PY3"')
+        seg = t[i:t.index("fi", i)]
         self.assertIn("*[!0-9]*)", seg,
                       "缺了非数字防线：rotate.py 崩掉时 log() 走 stdout，"
                       "变量会是多行日志 + skip")
+        # 必须先切字段再校验数字：顺序反了 "0 ok" 会被整串含非数字而误判
+        self.assertLess(seg.index('${LEAK_RAW%% *}'), seg.index("*[!0-9]*"),
+                        "先切字段再校验，否则 '0 ok' 会被当成多行日志")
+        self.assertIn("noip", seg, "契约需携带「按 IP 反查是否可用」")
 
 
 class TestLeakIpTtl(RotateTestBase):
@@ -1003,10 +1009,20 @@ class TestLeakIpTtl(RotateTestBase):
         self.assertIn("1.2.3.4", ips, "一次解析失败不该把缓存清空")
 
     def test_status_reports_when_by_ip_is_unavailable(self):
-        """检测器对它自己的目标静默失明，必须看得见。"""
-        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
-        self.assertIn("IP 反查", src,
-                      "按 IP 匹配失效时必须在状态里说出来")
+        """检测器对它自己的目标静默失明，必须在**两处**说出来。
+
+        早先只在 rotate.py --status 里说了，而 status.sh 走的是 --leak-count，
+        那条绿字完全不披露检测器是否半盲 —— 在半盲状态下说「未发现」是在骗人。
+        """
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        self.assertIn("IP 反查", r, "--status 需披露按 IP 反查不可用")
+        i = r.index("if args.leak_count:")
+        blk = r[i:r.index("if args.", i + 10)]
+        self.assertIn("noip", blk, "--leak-count 必须在 stdout 上带可用性标记")
+
+        s = (ROOT / "status.sh").read_text(encoding="utf-8")
+        self.assertIn("半盲", s, "status.sh 必须在检测器半盲时改变措辞")
+        self.assertIn('LEAK_IP', s)
 
 
 class TestRecheckCounterCarrier(unittest.TestCase):
@@ -1168,21 +1184,51 @@ class TestInstallGuards(unittest.TestCase):
                       "dry-run 打印的是这句，不是非 dry-run 的「无法核对」")
 
     def test_three_cases_are_mutually_exclusive(self):
-        cases = {
-            "!! 分流规则异常：opencode.ai 已加载的规则指向 DIRECT": "die",
-            "    (dry-run) 分流核对：UNKNOWN": "warn",
-            "--- 轮换开始 | 当前节点=JP": "ok",
-        }
-        for text, want in cases.items():
-            if "分流规则异常" in text:
-                got = "die"
-            elif "分流核对：UNKNOWN" in text:
-                got = "warn"
-            elif "轮换开始" in text:
-                got = "ok"
-            else:
-                got = "auth-fail"
-            self.assertEqual(got, want, "判据对 %r 的判定错了" % text[:30])
+        """**真的执行 install.sh 的判据**，不是在测试里抄一份 if/elif。
+
+        上一版这里构造一个字典、然后在自己抄的 if/elif 链上断言抄对了 ——
+        一个同义反复：把 install.sh 的三段判据整个删掉，它照样绿。
+        现在把 install.sh 里那几行判据**抽出来当代码执行**。
+        """
+        src = self._install()
+        # 抽出 install.sh 那三段判据里 grep 的字符串（按文件里的出现顺序）
+        conds, rest = [], src
+        while True:
+            a = rest.find("grep -q '")
+            if a < 0:
+                break
+            rest = rest[a + 9:]
+            b = rest.find("'")
+            conds.append(rest[:b])
+            rest = rest[b:]
+        self.assertGreaterEqual(len(conds), 3, "install.sh 里应有三段 grep 判据")
+        self.assertEqual(conds[:3], ["分流规则异常", "分流核对：UNKNOWN", "轮换开始"],
+                         "三段判据的内容或顺序变了")
+
+        def classify(output):
+            """按 install.sh 那三段的真实顺序判定。"""
+            for cond, verdict in zip(conds[:3], ("die", "warn", "ok")):
+                if cond in output:
+                    return verdict
+            return "auth-fail"
+
+        self.assertEqual(classify("!! 分流规则异常：opencode.ai 指向 DIRECT"), "die")
+        self.assertEqual(classify("(dry-run) 分流核对：UNKNOWN  <- 读不到"), "warn")
+        self.assertEqual(classify("--- 轮换开始 | 当前节点=JP"), "ok")
+        self.assertEqual(classify("HTTP Error 401: Unauthorized"), "auth-fail")
+
+    def test_guard_order_puts_violation_first(self):
+        """三段判据的**顺序**就是优先级：违规必须最先判。
+
+        顺序错了就会出现「VIOLATION 被当成认证失败」——
+        那正是第六轮发现、第八轮修掉的那个 bug。
+        """
+        src = self._install()
+        a = src.index("grep -q '分流规则异常'")
+        b = src.index("grep -q '分流核对：UNKNOWN'")
+        c = src.index("grep -q '轮换开始'")
+        self.assertLess(a, b, "违规判据必须在 UNKNOWN 之前")
+        self.assertLess(b, c, "UNKNOWN 判据必须在「认证正常」之前")
 
 
 class TestUninstallPurge(unittest.TestCase):

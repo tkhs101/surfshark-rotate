@@ -241,16 +241,38 @@ line "泄漏检测"
 # `*[!0-9]*` 是最后一道防线：rotate.py 崩掉时 log() 走 stdout，
 # 变量会是多行日志 + skip，必须归为「读不到」而不是条数。
 LEAK_RAW="$("$PY3" "$BASE/rotate.py" --leak-count 2>/dev/null)"
-case "$LEAK_RAW" in
-    skip|'')      LEAK_N=skip ;;
-    *[!0-9]*)     LEAK_N=skip ;;
-    *)            LEAK_N="$LEAK_RAW" ;;
-esac
+# 契约：stdout 是「十进制非负整数[ ok|noip]」，或字面量 skip。
+# **不用退出码承载** —— `|| echo skip` 会把 echo 的输出也收进变量
+# （实测变成两行 skip），而 skip 的 case 模式匹配不上，
+# 于是「读不到」被当成泄漏条数。
+#
+# 先按空格切成两个字段，**再**校验第一个是不是纯数字 ——
+# 顺序反了的话 "0 ok" 会因为整串含空格与字母而被当成多行日志。
+LEAK_N=skip
+LEAK_IP=ok
+if [ "$LEAK_RAW" != "skip" ] && [ -n "$LEAK_RAW" ]; then
+    _LEAK_NUM="${LEAK_RAW%% *}"          # 第一字段：条数
+    _LEAK_TAG="${LEAK_RAW##* }"          # 第二字段：ok / noip
+    case "$_LEAK_NUM" in
+        # 非纯数字 -> rotate.py 崩了，它的 log() 走 stdout，
+        # 变量会是多行日志 + 条数，必须归为「读不到」而不是条数。
+        ''|*[!0-9]*) LEAK_N=skip ;;
+        *)            LEAK_N="$_LEAK_NUM"; LEAK_IP="$_LEAK_TAG" ;;
+    esac
+fi
 case "$LEAK_N" in
     skip|"")
         c_warn "  读不到，跳过（mihomo API 可能不通，或 rotate.py 不可用）" ;;
     0)
-        c_ok   "  未发现 opencode.ai 走直连" ;;
+        if [ "$LEAK_IP" = "off" ]; then
+            # 【半盲时不给绿字】sniffer 失效正是这条检测要覆盖的场景，
+            # 而按 IP 反查不可用时它退化成「只按域名匹配」——
+            # 也就是对它自己的目标失明。在这种状态下说「未发现」是在骗人。
+            c_warn "  未发现 opencode.ai 走直连，**但本次判定是半盲的**"
+            c_warn "    （按 IP 反查不可用，只按域名匹配；sniffer 失效正是要覆盖的场景）"
+        else
+            c_ok   "  未发现 opencode.ai 走直连"
+        fi ;;
     *)
         # 门用状态文件的 degraded 标记，与 rotate.py --status 保持一致。
         # 早先这里用 AF_NOW，于是「degraded=true 但 AUTOFALL 已切回 PROXY」
