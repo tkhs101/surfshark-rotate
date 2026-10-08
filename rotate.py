@@ -281,6 +281,48 @@ def reload_config():
     time.sleep(5)
 
 
+# 需要盯的流量。opencode.ai 是唯一「泄漏即严重」的目标：它直连时，
+# 对端看到的就是这台 VPS 自己的 GCP 机房 IP。
+LEAK_HOST = "opencode.ai"
+
+
+def direct_leaks():
+    """当前是否有 opencode.ai 的连接正在走 DIRECT。
+
+    **阳性检测，不是推断。** 其它所有信号都是「探测失败 -> 猜是不是该降级」；
+    这一条直接读 mihomo 已经建立的连接，看它实际走了哪条链。
+
+    为什么要它：有一个失效模式其它信号全都看不见 —— 降级逻辑完全正常、
+    AUTOFALL 好好指着 PROXY，但分流规则被外部改动（opencode.ai 那条规则改了
+    目标、或 sniffer 失效导致域名没被还原）而落进 MATCH,DIRECT。
+    此时没有探测失败、没有降级、status.sh 一片绿，**而 opencode.ai 正在直连**。
+    这是「无信号泄漏」里最隐蔽的一种。
+
+    chains 的形状实测为 ["KR 韩国-首尔", "PROXY", "AUTOFALL"]，
+    chains[0] 才是真正承载流量的出站。
+
+    降级期间（AUTOFALL=DIRECT）出现 DIRECT 是**设计如此**，不算泄漏；
+    调用方负责区分，否则每次降级都会报一个假警。
+    """
+    try:
+        data = api("/connections")
+    except Exception:
+        return None
+    hits = []
+    for c in (data.get("connections") or []):
+        if not isinstance(c, dict):
+            continue
+        md = c.get("metadata") or {}
+        hosts = (md.get("host"), md.get("sniffHost"), md.get("destinationIP") or "")
+        dst = md.get("destinationIP") or ""
+        if not any(LEAK_HOST in (h or "") for h in hosts) and            not (dst and LEAK_HOST in str(md.get("host") or "")):
+            continue
+        chains = c.get("chains") or []
+        if chains and chains[0] == "DIRECT":
+            hits.append((md.get("host") or md.get("destinationIP") or "?", dst))
+    return hits
+
+
 def conns_on(node):
     """经过指定节点的活跃连接数（仅用于状态观测）"""
     try:
@@ -925,6 +967,22 @@ def show_status():
     else:
         log(f"轮换产出 : 正常（本轮 {ip or '(未知)'}）")
     log(f"该节点连接 : {conns_on(node)}")
+    # 未降级却出现 opencode.ai 走 DIRECT = 正在泄漏，且没有任何其它信号能看见
+    leaks = direct_leaks()
+    if leaks is None:
+        log("泄漏检测 : 读不到 /connections（mihomo API 不通），跳过")
+    elif leaks and not degraded:
+        log(f"⚠ 泄漏检测 : 有 {len(leaks)} 条 {LEAK_HOST} 连接正在走 DIRECT！")
+        for h, dst in leaks[:3]:
+            log(f"    {h} {dst}")
+        log(f"  但降级标记为「否」、AUTOFALL={now} —— 按设计不该出现这种情况。")
+        log("  最可能：config.yaml 里 opencode.ai 的分流规则被改动，"
+            "或 sniffer 失效导致域名没被还原、落进 MATCH,DIRECT。")
+        log("  排查：sudo bash %s/status.sh" % BASE)
+    elif leaks:
+        log(f"泄漏检测 : {len(leaks)} 条走 DIRECT —— 降级期间属预期，非异常")
+    else:
+        log(f"泄漏检测 : 未发现 {LEAK_HOST} 走直连")
     log(f"当前档位 : {st.get('tier', 0)+1} / {len(TIERS)}")
     log(f"配置路径 : {CONFIG_PATH} ({'存在' if os.path.exists(CONFIG_PATH) else '不存在'})")
 

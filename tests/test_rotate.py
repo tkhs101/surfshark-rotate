@@ -50,6 +50,7 @@ class FakeMihomo(BaseHTTPRequestHandler):
     delays = {}
     requests = []
     dead_urls = set()
+    connections = []
 
     def _auth_ok(self):
         return self.headers.get("Authorization") == "Bearer testsecret"
@@ -68,6 +69,9 @@ class FakeMihomo(BaseHTTPRequestHandler):
             return self._send(401, {"message": "unauthorized"})
         if self.path == "/version":
             return self._send(200, {"version": "test"})
+        if self.path == "/connections":
+            return self._send(200, {"connections": type(self).connections,
+                                    "uploadTotal": 0, "downloadTotal": 0})
         for name in self.groups:
             if self.path == "/proxies/" + name:
                 return self._send(200, dict(self.groups[name], type="Selector"))
@@ -127,6 +131,7 @@ class RotateTestBase(unittest.TestCase):
         FakeMihomo.delays = {"JP 日本-东京": 137, "KR 韩国-首尔": 42}
         FakeMihomo.requests = []
         FakeMihomo.dead_urls = set()
+        FakeMihomo.connections = []
 
         import rotate
         self.rotate = rotate
@@ -485,6 +490,60 @@ class TestRealHookGate(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual((tmp / ".rotate_state.json").read_text(encoding="utf-8"), raw,
                          "损坏的状态文件是唯一证据，不能被覆盖")
+
+
+class TestLeakDetection(RotateTestBase):
+    """阳性泄漏检测：读 mihomo 已建立的连接，看 opencode.ai 实际走了哪条链。
+
+    它覆盖的是唯一一个没有任何其它信号能看见的失效：分流规则被外部改动或
+    sniffer 失效，落进 MATCH,DIRECT —— 此时没有探测失败、没有降级、status 全绿。
+    """
+
+    def _conn(self, host, chains):
+        return {"metadata": {"host": host, "destinationIP": "1.2.3.4",
+                             "sniffHost": host},
+                "chains": chains, "upload": 10, "download": 20}
+
+    def test_no_leak_when_autofall_chain_is_used(self):
+        self.seed()
+        FakeMihomo.connections = [
+            self._conn("api.opencode.ai", ["KR 韩国-首尔", "PROXY", "AUTOFALL"])]
+        self.assertEqual(self.rotate.direct_leaks(), [])
+
+    def test_detects_opencode_going_direct(self):
+        self.seed()
+        FakeMihomo.connections = [
+            self._conn("api.opencode.ai", ["KR 韩国-首尔", "PROXY", "AUTOFALL"]),
+            self._conn("api.opencode.ai", ["DIRECT"]),
+        ]
+        hits = self.rotate.direct_leaks()
+        self.assertEqual(len(hits), 1, "必须认出 chains[0]==DIRECT 的那条")
+
+    def test_ignores_other_hosts(self):
+        self.seed()
+        FakeMihomo.connections = [
+            self._conn("ip.sb", ["DIRECT"]),          # ip.sb 规则本身挂 PROXY，
+            self._conn("www.google.com", ["DIRECT"])]  # 其它 MATCH,DIRECT 属正常
+        self.assertEqual(self.rotate.direct_leaks(), [])
+
+    def test_matches_sniffed_host_and_bare_domain(self):
+        self.seed()
+        FakeMihomo.connections = [
+            {"metadata": {"host": "", "sniffHost": "opencode.ai",
+                          "destinationIP": "104.18.1.1"},
+             "chains": ["DIRECT"]}]
+        self.assertEqual(len(self.rotate.direct_leaks()), 1,
+                         "sniffer 还原出的域名也要认 —— 那正是失效模式本身")
+
+    def test_returns_none_when_api_unreachable(self):
+        self.seed()
+        saved = self.rotate.API
+        self.rotate.API = "http://127.0.0.1:1"     # 必然连不上
+        try:
+            self.assertIsNone(self.rotate.direct_leaks(),
+                              "读不到要返回 None，不能当成「没有泄漏」")
+        finally:
+            self.rotate.API = saved
 
 
 class TestHookShell(unittest.TestCase):

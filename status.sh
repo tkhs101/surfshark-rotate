@@ -162,6 +162,60 @@ else
     c_ok "  分流正常：只有 opencode.ai / ip.sb 走代理"
 fi
 
+line "泄漏检测"
+# ------------------------------------------------------------
+# 阳性检测：直接读 mihomo 已经建立的连接，看 opencode.ai 实际走了哪条链。
+# 与其它所有信号不同 —— 那些是「探测失败 -> 猜是不是该降级」，这一条是
+# 「它此刻真的在直连」。它覆盖的是唯一一个没有任何其它信号能看见的失效：
+# 分流规则被外部改动、或 sniffer 失效导致域名没被还原而落进 MATCH,DIRECT ——
+# 此时没有探测失败、没有降级、本页一片绿，而 opencode.ai 正在用本机 IP 出网。
+#
+# 降级期间出现 DIRECT 是设计如此，不算泄漏，所以只在「未降级」时报。
+if [ -n "$BASE_SECRET" ] && [ -n "$PY3" ]; then
+    LEAK_N="$("$PY3" -c '
+import json, sys, urllib.request
+req = urllib.request.Request("http://127.0.0.1:9097/connections",
+                             headers={"Authorization": "Bearer " + sys.argv[1]})
+try:
+    data = json.load(urllib.request.urlopen(req, timeout=10))
+except Exception:
+    print("skip"); raise SystemExit
+n = 0
+for c in (data.get("connections") or []):
+    if not isinstance(c, dict):
+        continue
+    md = c.get("metadata") or {}
+    blob = " ".join(str(md.get(k) or "") for k in ("host", "sniffHost", "destinationIP"))
+    if "opencode.ai" not in blob:
+        continue
+    ch = c.get("chains") or []
+    if ch and ch[0] == "DIRECT":
+        n += 1
+print(n)' "$BASE_SECRET" 2>/dev/null)"
+    DEG_NOW="$AF_NOW"
+    case "$LEAK_N" in
+        skip|"")
+            c_warn "  读不到 /connections，跳过（mihomo API 可能不通）" ;;
+        0)
+            c_ok   "  未发现 opencode.ai 走直连" ;;
+        *)
+            if [ "$DEG_NOW" = "DIRECT" ]; then
+                c_warn "  有 $LEAK_N 条 opencode.ai 连接走 DIRECT —— 降级期间属预期"
+            else
+                printf '\n\033[1;41m\033[97m  ⚠ 正在泄漏：opencode.ai 走直连，但系统未判定降级  \033[0m\n'
+                c_err "  有 $LEAK_N 条 opencode.ai 的连接正在走 DIRECT。"
+                c_err "  但降级标记为「否」、AUTOFALL=${AF_NOW:-未知} —— 按设计不该出现这种情况。"
+                c_err "  对端看到的就是这台 VPS 的公网 IP（$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)）。"
+                c_err "  最可能：config.yaml 里 opencode.ai 的分流规则被改动，"
+                c_err "        或 sniffer 失效导致域名没被还原、落进 MATCH,DIRECT。"
+                echo
+            fi ;;
+    esac
+else
+    c_warn "  跳过（拿不到密钥或 python3）"
+fi
+echo
+
 line "轮换器内部状态"
 # ------------------------------------------------------------
 if [ -f "$BASE/rotate.py" ]; then
