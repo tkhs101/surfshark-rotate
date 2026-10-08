@@ -206,41 +206,42 @@ proxy-groups:
   #  也就是说密钥一过期，本项目唯一的产出（IP 轮换）就整体停摆，
   #  而除了翻 journal 没有别的信号能发现。
   #
-  #  AUTOFALL 是 fallback 组，成员顺序即优先级，取第一个健康的：
-  #  PROXY 健康时永远选它，只有整个 PROXY 组都不健康才落到 DIRECT。
+  #  AUTOFALL 是 **select** 组而不是 fallback 组 —— 这个选择是刻意的，
+  #  也是本次修复的核心：降级与恢复完全由 rotate.py 通过
+  #  PUT /proxies/AUTOFALL 显式切换，内核不参与判断。
   #  PROXY 组本身不动，rotate.py 照旧操作它。
   #
-  #  实测（真实内核 v1.19.32）：
-  #    节点全死    → AUTOFALL 选中 DIRECT，请求正常发出
-  #    节点恢复后  → 下一轮健康检查自动切回 PROXY，无需人工干预
-  #
-  #  lazy: false 是刻意的。默认 lazy: true 会在每条连接路由时触发健康检查，
-  #  而每轮轮换都要热重载重建隧道 —— 实测重建只要 0.2~0.7 秒，
-  #  远小于下面的 interval，所以定周期检查几乎撞不上重建窗口
-  #  （3 轮真实轮换、每轮 26 秒采样 126 次，零误降级）。
-  #  但 lazy 会让每个恰好落在重建窗口里的新连接都被判成节点已死而送去直连。
-  #
-  #  timeout 从默认的 5000 提到 15000 —— 这是降低误降级率**唯一**真正有效的杠杆。
-  #  【必须知道的机制边界】mihomo 的 fallback 判定是单样本布尔查表：
-  #  fallback.go 的 findAliveProxy() 顺序遍历成员、返回第一个
-  #  AliveForTestUrl()==true 的，Now() 直接调它，中间没有任何计数器、迟滞或冷却。
+  #  【为什么不能用 fallback】实测（真实内核 v1.19.32）：
+  #    · fallback 的判定是**单样本布尔查表**。fallback.go 的 findAliveProxy()
+  #      顺序遍历成员、返回第一个 AliveForTestUrl()==true 的，Now() 直接调它，
+  #      中间没有任何计数器、迟滞或冷却 —— 隧道抖一下，下一条连接立刻走直连。
   #    · max-failed-times 名字像，但只作用于 onDialFailed（拨号失败路径），
   #      周期健康检查根本不走它 —— 照抄会得到「以为防住了其实没防住」
   #    · fixed 钉选成员同样压不住，存活检查照样覆盖它
-  #    · relay 组已被移除；fallback-filter 是 DNS 字段，不是代理组
-  #  结论：没有任何配置开关能给 fallback 加去抖。单样本在原理上无法区分
-  #  「瞬时抖动」和「真死」，只能调阈值让抖动不够大 —— 这就是 timeout 的作用。
-  #  代价是真故障发现延迟从 interval+5 变成 interval+15 秒，
-  #  相对「持续数天」的密钥过期可以忽略。
+  #    · relay 组已移除；fallback-filter 是 DNS 字段，不是代理组
+  #  结论：没有任何配置开关能给 fallback 加去抖，而单样本在原理上也无法
+  #  区分「瞬时抖动」和「真死」。所以调 timeout / interval 只能降低误判率，
+  #  永远降不到零。
+  #
+  #  【实测代价】17 小时内 AUTOFALL 翻到 DIRECT 共 5 次（其中 3 次来自我自己的
+  #  破坏密钥测试与密集压测），真实发生 1 次：01:20:25 有两条 opencode.ai 的
+  #  连接以 AUTOFALL[DIRECT] 发出，即用本机 GCP 机房 IP 出网。那一刻没有任何
+  #  轮换在跑，是纯粹的共享路径抖动。对本项目而言泄漏比失败更糟 —— 失败只是
+  #  断一次，泄漏是把机房 IP 送到对方面前，而暴露机房 IP 恰恰是这个项目
+  #  要避免的事。改成 select 之后，这 5 次翻转一次都不会再发生。
+  #
+  #  【降级与恢复】
+  #    降级：rotate.py 连续 2 轮取不到出口 IP 才切到 DIRECT
+  #          （DEGRADE_AFTER_FAILS，约 10 分钟），要求故障持续至少
+  #          一个完整轮换周期 —— 私钥到期会持续数天必然满足，瞬时抖动不会。
+  #    恢复：判据走控制面（节点 delay 探测），完全不经过 AUTOFALL 与数据面。
+  #          用 AUTOFALL 自己的状态判断恢复会自证循环。
+  #          换私钥必然要 restart mihomo，on-mihomo-up.sh 在那里负责恢复。
   - name: "AUTOFALL"
-    type: fallback
+    type: select
     proxies:
       - "PROXY"
-      - "DIRECT"     # 必须放最后：fallback 取第一个健康的成员
-    url: "http://cp.cloudflare.com/"
-    interval: 60
-    timeout: 15000
-    lazy: false
+      - "DIRECT"
 
 # --------------------------------------------------------------
 #  分流

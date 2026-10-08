@@ -66,33 +66,54 @@ for _ in $(seq 1 30); do
 done
 [ "$READY" -eq 1 ] || { say "控制接口 30 秒内没起来，本次不处理"; exit 0; }
 
-# ---- 查 AUTOFALL 当前选的是谁 ----
-NOW="$("$PY3" - <<'PY' 2>/dev/null
-import json, re, sys, urllib.request
+# ---- 节点是否真的活了 ----
+#
+# 【为什么不能看 AUTOFALL 现在选的是谁】AUTOFALL 已经改成 select 组，
+# 由 rotate.py 显式切换，降级期间它就是 DIRECT —— 那是**我们自己的选择**，
+# 不是内核的判断。拿它判断恢复会自证循环：DIRECT 意味着「我们判定降级了」，
+# 不意味着「节点还没好」。
+#
+# 这里走控制面的 /proxies/<节点>/delay，完全不经过 AUTOFALL 与数据面。
+# 它回答的是一个独立问题：节点本身现在通不通。
+#
+# 输出 "<当前节点> <延迟毫秒>" 表示活着；输出空串表示还没活。
+RESULT="$("$PY3" - <<'PY' 2>/dev/null
+import json, re, sys, urllib.parse, urllib.request
 cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
-m = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
-if not m:
+sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
+if not sec:
     sys.exit(0)
-req = urllib.request.Request("http://127.0.0.1:9097/proxies/AUTOFALL",
-                             headers={"Authorization": "Bearer " + m.group(1)})
+H = {"Authorization": "Bearer " + sec.group(1)}
+API = "http://127.0.0.1:9097"
+
+
+def get(path, timeout=15):
+    req = urllib.request.Request(API + path, headers=H)
+    return json.load(urllib.request.urlopen(req, timeout=timeout))
+
+
 try:
-    print(json.load(urllib.request.urlopen(req, timeout=5)).get("now") or "")
+    node = get("/proxies/PROXY").get("now") or ""
+    if not node:
+        sys.exit(0)
+    q = urllib.parse.quote(node, safe="")
+    u = urllib.parse.quote("http://cp.cloudflare.com/", safe="")
+    d = get("/proxies/%s/delay?timeout=8000&url=%s" % (q, u), timeout=20)
+    delay = d.get("delay")
+    if isinstance(delay, int) and delay > 0:
+        print("%s %d" % (node, delay))
 except Exception:
     pass
 PY
 )"
 
-if [ -z "$NOW" ]; then
-    # 老版本 config.yaml 没有 AUTOFALL 组 —— 无从判断是否恢复，留给人工。
-    say "读不到 AUTOFALL 组（config.yaml 版本较旧？），本次不处理"
-    exit 0
-fi
+NODE_ALIVE="${RESULT%% *}"
+DELAY_MS="${RESULT##* }"
 
-if [ "$NOW" = "DIRECT" ]; then
-    # mihomo 的健康检查还没跑到，节点此刻确实还没被判定为恢复。
-    # 起一个一次性复查：到点再判断一次，成功就把定时器启回来。
+if [ -z "$NODE_ALIVE" ]; then
+    # 节点此刻确实还没活。起一个一次性复查：到点再判断一次，成功就启回定时器。
     # 用 systemd-run 而不是常驻 timer —— 平时根本不存在这个东西。
-    say "AUTOFALL 仍是 DIRECT，${RECHECK_DELAY}s 后复查一次"
+    say "控制面探测节点失败，${RECHECK_DELAY}s 后复查一次"
     if command -v systemd-run >/dev/null; then
         systemd-run --quiet --unit=surfshark-rotate-resume \
             --on-active="${RECHECK_DELAY}" \
@@ -104,18 +125,35 @@ if [ "$NOW" = "DIRECT" ]; then
     exit 0
 fi
 
-# ---- 已恢复：启回定时器并清标记 ----
+# ---- 已恢复：切回代理、启回定时器并清标记 ----
 if systemctl start "$TIMER" 2>/dev/null; then
     "$PY3" -c 'import json,sys
 p = sys.argv[1]
 try:
     d = json.load(open(p))
-    for k in ("degraded", "degraded_reason", "degraded_at", "fail_streak"):
+    for k in ("degraded", "degraded_reason", "degraded_at", "fail_streak", "direct_seen"):
         d.pop(k, None)
+    d["fail_streak"] = 0
     json.dump(d, open(p, "w"), ensure_ascii=False, indent=2)
 except Exception:
     pass' "$STATE" 2>/dev/null
-    say "节点已恢复（AUTOFALL=$NOW），已重新启用 $TIMER"
+    # 顺手把 AUTOFALL 切回 PROXY。降级时是我们自己把它设成 DIRECT 的，
+    # 光清状态不够 —— 否则要等到下一轮轮换（最多 5 分钟）才纠正回来，
+    # 这段时间 opencode.ai 仍在用本机 IP 出网，正是这个项目要避免的事。
+    "$PY3" - <<'PYHOOK' 2>/dev/null
+import json, re, sys, urllib.request
+cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
+sec = re.search(r'(?m)^secret:\s*"?([^"#\s]+)"?\s*$', cfg)
+if sec:
+    req = urllib.request.Request(
+        "http://127.0.0.1:9097/proxies/AUTOFALL",
+        method="PUT", data=json.dumps({"name": "PROXY"}).encode(),
+        headers={"Authorization": "Bearer " + sec.group(1),
+                 "Content-Type": "application/json"})
+    urllib.request.urlopen(req, timeout=10).read()
+PYHOOK
+    say "节点已恢复（$NODE_ALIVE 延迟 ${DELAY_MS}ms），已重新启用 $TIMER"
+    say "AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP"
 else
     say "启用 $TIMER 失败，请手工执行：systemctl start $TIMER"
 fi

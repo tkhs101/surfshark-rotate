@@ -41,6 +41,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 # ============================================================
@@ -285,53 +286,53 @@ def autofall_now():
         return None
 
 
-def is_degraded():
-    return autofall_now() == DEGRADED_TO
+def set_autofall(target):
+    """把 AUTOFALL 组显式切到 PROXY 或 DIRECT。
 
-
-# 停定时器前需要的连续佐证轮数。
-#
-# 【为什么不能看到 DIRECT 就停】内核的 fallback 是单样本布尔查表，没有任何迟滞
-# （见 config.yaml 里 AUTOFALL 的注释），所以隧道抖一下 AUTOFALL 就会翻到 DIRECT。
-# 实测 17 小时内翻过 2 次，其中一次让 opencode.ai 的连接用本机 IP 出去。
-# 而 mark_degraded 会 systemctl stop 掉轮换定时器，全仓库只有
-# on-mihomo-up.sh（挂在 mihomo 重启上）能把它启回来。
-# 于是一次 1~2 分钟的抖动，只要落在某个 5 分钟轮次窗口内（约 20~40% 概率），
-# 轮换就会永久停摆，除了翻 journal 没人会发现。
-#
-# 要求连续两轮都看到 DIRECT 才停，等价于要求它持续至少一个轮换周期 ——
-# 真降级（密钥到期）会持续数天，必然满足；瞬时抖动不会。
-DEGRADE_CONFIRM_ROUNDS = 2
-
-
-def check_degradation(state):
-    """返回 True 表示已确认降级、应当停掉轮换定时器。
-
-    单次看到 DIRECT 只记日志不停手 —— 本轮不做任何变更动作。
+    AUTOFALL 是 select 组，没有健康检查，因此**永不自行翻转** ——
+    降级与恢复只可能由本脚本的这一次调用造成。这就是瞬时泄漏归零的
+    结构保证：实测 17 小时内内核自行翻转 5 次、其中 1 次让 opencode.ai
+    用本机机房 IP 出网，改成 select 之后这种情况一次都不会再发生。
     """
-    if not is_degraded():
-        if state.get("direct_seen"):
-            log("    内核已切回 PROXY —— 上一轮的 DIRECT 判定为瞬时抖动，不降级、不停定时器")
-            state["direct_seen"] = 0
-            save_state(state)
+    try:
+        # api() 把 body 原样交给 urllib，必须是 bytes —— 与 switch() 同一写法
+        api("/proxies/" + AUTOFALL, "PUT", json.dumps({"name": target}).encode())
+        return True
+    except Exception as e:
+        log("!! 切换 AUTOFALL 到 %s 失败：%s" % (target, e))
         return False
 
-    seen = int(state.get("direct_seen") or 0) + 1
-    state["direct_seen"] = seen
-    save_state(state)
-    if seen < DEGRADE_CONFIRM_ROUNDS:
-        log(f"!! 内核报告节点不可用（AUTOFALL=DIRECT），第 {seen}/{DEGRADE_CONFIRM_ROUNDS} 次")
-        log("   本轮不做任何变更，也不停定时器 —— 等下一轮复核，避免瞬时抖动导致停摆")
+
+# 节点健康探测用的 URL。只经由控制面的 /proxies/<节点>/delay 端点使用，
+# 不参与分流规则，所以与出口 IP 探测（ip.sb，经数据面）是两条独立通道。
+NODE_HEALTH_URL = "http://cp.cloudflare.com/"
+
+
+def node_healthy(node, timeout_ms=8000):
+    """探测某个节点本身是否可用。
+
+    【为什么不用 AUTOFALL 判断恢复】降级时 AUTOFALL 正是我们自己设成
+    DIRECT 的，拿它判断恢复会自证循环。这里走控制面的
+    /proxies/<name>/delay —— 完全不经过 AUTOFALL，也不经过数据面，
+    所以 AUTOFALL 当前指向谁都不影响这个结论。
+    """
+    try:
+        q = urllib.parse.quote(node, safe="")
+        u = urllib.parse.quote(NODE_HEALTH_URL, safe="")
+        d = api("/proxies/%s/delay?timeout=%d&url=%s"
+                % (q, timeout_ms, u), timeout=timeout_ms / 1000.0 + 10)
+        delay = d.get("delay")
+        return isinstance(delay, int) and delay > 0
+    except Exception:
         return False
-    return True
 
 
 def mark_degraded(state, reason):
-    """进入降级态：记状态、停掉没意义的轮换定时器、把恢复步骤打出来。
+    """进入降级态：切 AUTOFALL 到直连、记状态、停掉没意义的轮换定时器。
 
     停定时器是对的：此时切节点、热重载、探测出口 IP 全都做不出结果，
     每 5 分钟重试一次只是空转。恢复由 on-mihomo-up.sh 钩子负责 ——
-    换私钥必然要 restart mihomo，钩子会在那里把定时器启回来。
+    换私钥必然要 restart mihomo，钩子会在那里复查节点是否真的活了。
     """
     was = state.get("degraded")
     state["degraded"] = True
@@ -341,7 +342,9 @@ def mark_degraded(state, reason):
 
     if was is not True:
         log("!! 进入降级态：%s" % reason)
-        log("   节点全挂，opencode.ai / ip.sb 已自动退到直连（还能用，但出口变回本机）")
+        if set_autofall(DEGRADED_TO):
+            log("   AUTOFALL 已切到 %s，opencode.ai 会退到直连（还能用，但出口变回本机）"
+                % DEGRADED_TO)
         log("   IP 轮换已停摆 —— 这是本项目唯一的产出，现在等于空转")
     if os.path.exists("/run/systemd/system"):
         r = subprocess.run(["systemctl", "stop", ROTATE_TIMER],
@@ -353,8 +356,7 @@ def mark_degraded(state, reason):
     log("   恢复步骤：")
     log("     1. 换新的 Surfshark WireGuard 私钥（config.yaml 里 private-key，4 处共用同一个）")
     log("     2. sudo systemctl restart mihomo")
-    log("        钩子会在 mihomo 起来后复查：若节点已恢复，自动重新启用 %s" % ROTATE_TIMER)
-    log("        （mihomo 自己的健康检查最多再花 1 个 interval 才切回，不必等它先跑完）")
+    log("        钩子会在 mihomo 起来后用控制面探测节点是否真的活了，是则自动恢复")
     log("     3. 若 1 分钟内没自动恢复，手工执行：sudo systemctl start %s" % ROTATE_TIMER)
     return False
 
@@ -375,13 +377,19 @@ def clear_degraded(state):
     state.pop("degraded", None)
     state.pop("degraded_reason", None)
     state.pop("degraded_at", None)
-    state["direct_seen"] = 0
+    state.pop("direct_seen", None)
     state["fail_streak"] = 0
     save_state(state)
 
     if not was_degraded:
         log(f"    出口 IP 已恢复（此前连续 {streak} 轮取不到），轮换继续")
         return
+
+    # 非降级态必须让 AUTOFALL 指回 PROXY —— 它是我们自己设成 DIRECT 的。
+    # mihomo 会把 select 组的选择写进 cache.db 并跨重启保留，
+    # 所以这里显式纠正，防止任何异常残留把 opencode.ai 永远钉在直连上。
+    if set_autofall("PROXY"):
+        log("    AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP")
 
     # mark_degraded 停掉了定时器，所以「轮换恢复」这句话成立的前提是
     # 定时器确实还活着。降级后若只跑了手工的一轮、mihomo 没重启过，
@@ -484,18 +492,28 @@ def rotate_once(dry_run=False):
 
     tier, target = pick_next(state)
 
-    # 降级检测放在最前面。确认降级时本轮什么都不做就返回：
-    # 降级态下切节点、热重载、探测出口 IP 全都做不出结果，
-    # 继续跑只是每 5 分钟空转一次，还会把降级状态冲掉。
-    # 放在 current_node() 之后是因为要先确认 API 通。
+    # 降级态下的唯一出路是节点真的恢复。判据走控制面（节点 delay 探测），
+    # 不用 AUTOFALL 的当前选择 —— 那正是我们自己设成 DIRECT 的，
+    # 拿它判断恢复会自证循环。
     #
-    # 未经连续两轮佐证时（单次看到 DIRECT）同样不做任何变更动作 ——
-    # 宁可空转一轮，也不能因为一次瞬时抖动就把轮换永久停掉。
-    if check_degradation(state):
-        return mark_degraded(state, "连续两轮内核报告节点不可用（AUTOFALL=DIRECT）")
-    if state.get("direct_seen"):
-        log("--- 跳过本轮 ---")
+    # 恢复后不立刻做本轮轮换：刚恢复的节点可能还不稳，此刻重建隧道
+    # 等于用一个说不清的 IP 去记基线。干净退出，让下一轮正常轮换去建立基线。
+    if state.get("degraded"):
+        if node_healthy(live):
+            log("    节点已恢复，撤销降级")
+            set_autofall("PROXY")
+            clear_degraded(state)
+            log("--- 本轮不做轮换，让下一轮重新建立基线 ---")
+        else:
+            log("    节点仍不可用（控制面探测失败），维持降级")
         return False
+
+    # 非降级态就该走代理。mihomo 会把 select 组的选择持久化到 cache.db，
+    # 任何异常残留（例如手工改过、或降级中途被强杀）都要在这里纠正回来，
+    # 否则 opencode.ai 会被永久钉在直连上而无人察觉。
+    if autofall_now() not in (None, "PROXY"):
+        log("    发现 AUTOFALL 异常指向 %s，纠正回 PROXY" % autofall_now())
+        set_autofall("PROXY")
 
     old_ip = state.get("last_ip")
     log(f"--- 轮换开始 | 当前节点={live} | 档位={tier+1}/{len(TIERS)} "

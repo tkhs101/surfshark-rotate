@@ -24,9 +24,10 @@
 ```
 VPS 整机流量
    │
-   ├─ opencode.ai / ip.sb ──→ TUN ──→ AUTOFALL ──┬─（节点健康）→ PROXY 组 → WireGuard → Surfshark JP/KR
-   │                                             │                              （每 5 分钟换一次出口 IP）
-   │                                             └─（节点全挂）→ DIRECT ─────────→ 物理网卡
+   ├─ opencode.ai ──→ TUN ──→ AUTOFALL ──┬─（rotate.py 判定正常）→ PROXY 组 → WireGuard → Surfshark JP/KR
+   │                                      │                              （每 5 分钟换一次出口 IP）
+   │                                      └─（连续 2 轮探测失败）→ DIRECT ────→ 物理网卡
+   ├─ ip.sb ──→ TUN ──→ PROXY ────────────┴─→ WireGuard    （测量通道，故意不进降级链）
    └─ 其他所有（含 SSH）───→ DIRECT ─────────────────────────────→ 物理网卡
 ```
 
@@ -139,23 +140,38 @@ opencode.ai 会直接连不上，日志里只有一行 `dial PROXY ... context d
 
 现在分两层处理：
 
-### 数据面：自动退到直连（内核层，无需人工）
+### 数据面：自动退到直连（脚本层决策，内核不参与）
 
-`AUTOFALL` 是 `fallback` 组，成员 `[PROXY, DIRECT]`，取第一个健康的：
+`AUTOFALL` 是 `select` 组，成员 `[PROXY, DIRECT]`，**由 `rotate.py` 通过
+`PUT /proxies/AUTOFALL` 显式切换**：
 
 | 状态 | `AUTOFALL` 选中 | opencode.ai |
 |---|---|---|
 | 节点正常 | `PROXY` | 走 Surfshark 节点，IP 正常轮换 |
 | 节点全挂 | `DIRECT` | 走本机直连，**还能用**，但出口变回 VPS 自己的 IP |
 
-节点恢复后，mihomo 自己的健康检查会在下一个周期（≤60 秒）自动切回 `PROXY`。
+**为什么不用 `fallback` 组**：mihomo 的 `fallback` 判定是单样本布尔查表 ——
+`fallback.go` 的 `findAliveProxy()` 顺序遍历成员、返回第一个
+`AliveForTestUrl()==true` 的，`Now()` 直接调它，中间**没有任何计数器、迟滞或冷却**。
+隧道抖一下，下一条连接立刻走直连。实测 17 小时内内核自行翻转 5 次，其中一次
+（01:20:25，当时无轮换在跑）让两条 opencode.ai 的连接以 `AUTOFALL[DIRECT]` 发出，
+即用本机 GCP 机房 IP 出网。
+
+对本项目而言泄漏比失败更糟 —— 失败只是断一次，泄漏是把机房 IP 送到对方面前，
+而暴露机房 IP 恰恰是这个项目要避免的事。其它开关也压不住：
+`max-failed-times` 只作用于 `onDialFailed`（拨号失败路径），周期健康检查不走它；
+`fixed` 钉选成员仍被存活检查覆盖；`relay` 已移除；`fallback-filter` 是 DNS 字段。
+
+`select` 组没有健康检查，**永不自行翻转**。降级只在**连续 2 轮取不到出口 IP**
+（约 10 分钟）时触发 —— 要求故障持续至少一个完整轮换周期：私钥到期会持续数天，
+必然满足；瞬时抖动不会。
 
 ### 控制面：轮换自动停摆（脚本层）
 
 降级时继续轮换毫无意义，所以 `rotate.py` 会：
 
-1. 检测到 `AUTOFALL` 选中 `DIRECT`（或连续 2 轮取不到出口 IP）
-2. 记下降级状态，**停掉 `surfshark-rotate.timer`**
+1. 连续 2 轮取不到出口 IP
+2. 把 `AUTOFALL` 切到 `DIRECT`、记下降级状态、**停掉 `surfshark-rotate.timer`**
 3. 在日志里打出完整的恢复步骤
 
 所以看到 `surfshark-rotate.timer` 是 inactive 时，**先别当成故障** —— 看 `status.sh` 顶部有没有降级横幅。
@@ -168,10 +184,14 @@ opencode.ai 会直接连不上，日志里只有一行 `dial PROXY ... context d
 sudo systemctl restart mihomo
 ```
 
-`mihomo.service` 的 `ExecStartPost` 钩子（`on-mihomo-up.sh`）会自动复查：
-节点已恢复就把 `surfshark-rotate.timer` 启回来并清掉降级标记。
+`mihomo.service` 的 `ExecStartPost` 钩子（`on-mihomo-up.sh`）会自动复查。
+判据是**控制面的 `/proxies/<节点>/delay`** —— 节点本身现在通不通，
+完全不经过 `AUTOFALL` 与数据面（降级时 `AUTOFALL` 是我们**自己**设成 `DIRECT` 的，
+拿它判断恢复会自证循环）。确认恢复后钩子把 `AUTOFALL` 切回 `PROXY`、
+启回定时器并清掉降级标记。
 
-若 1 分钟内没自动恢复（`AUTOFALL` 的健康检查还没跑完），手工：
+若节点此刻还没活，钩子会起一个一次性复查（`systemd-run --on-active=90`，
+平时根本不存在这个东西）；仍没恢复就手工：
 
 ```bash
 sudo systemctl start surfshark-rotate.timer

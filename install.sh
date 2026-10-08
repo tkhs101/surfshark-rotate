@@ -593,8 +593,8 @@ sn = block("sniffer:", 0)
 af = block('- name: "AUTOFALL"', 2)
 if not sn or not af:
     print("NO_SNIFFER")
-elif scalar(af, "type") != "fallback":
-    print("AUTOFALL_NOT_FALLBACK")
+elif scalar(af, "type") != "select":
+    print("AUTOFALL_NOT_SELECT")
 elif members(af) != ["PROXY", "DIRECT"]:
     print("AUTOFALL_MEMBERS=%s" % (members(af) or "(空)"))
 elif not probe_pinned_to_proxy(lines):
@@ -611,15 +611,20 @@ PY
 )"
 if [ "$SNIFF" = "OK" ]; then
     c_ok "  ✓ 域名嗅探能力已启用（纯 IP 建连也能命中 DOMAIN 规则）"
-    c_ok "  ✓ 降级链已配置（节点全挂时退到直连，恢复后自动切回）"
+    c_ok "  ✓ 降级链已配置（节点全挂时退到直连，由 rotate.py 按连续失败判定）"
     c_ok "  ✓ 出口 IP 测量通道与降级链解耦（不会把本机 IP 误报成新出口）"
 else
     die "config.yaml 的能力校验未通过（判定=$SNIFF）。
   · WEAK                  → sniffer 段缺 enable: true 或 parse-pure-ip: true
   · NO_SNIFFER            → 找不到 sniffer 段，或 AUTOFALL 组缺失
-  · AUTOFALL_NOT_FALLBACK → AUTOFALL 不是 fallback 组，等于没有降级
-  · AUTOFALL_MEMBERS=...  → AUTOFALL 成员必须是 [PROXY, DIRECT] 且 DIRECT 在最后
-                            （顺序错了会变成永远直连：fallback 取第一个健康成员）
+  · AUTOFALL_NOT_SELECT   → AUTOFALL 必须是 select 组。
+                            必须是 select 而不是 fallback：fallback 的降级判定
+                            是单样本布尔查表（findAliveProxy 无计数、无迟滞），
+                            隧道抖一下就会翻到 DIRECT，实测 17 小时内翻过 5 次、
+                            其中 1 次让 opencode.ai 用本机机房 IP 出网。
+                            select 没有健康检查，永不自行翻转。
+  · AUTOFALL_MEMBERS=...  → AUTOFALL 成员必须是 [PROXY, DIRECT]，PROXY 在前
+                            （rotate.py 按名字切换，顺序决定首次启动的默认选择）
   · PROBE_ON_AUTOFALL     → DOMAIN-SUFFIX,ip.sb 必须指向 PROXY 而不是 AUTOFALL。
                             挂在 AUTOFALL 上时，降级会让探测走直连返回本机 IP，
                             而轮次进行中就会把它当成「换到的新出口」记下来。
