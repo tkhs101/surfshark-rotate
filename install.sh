@@ -574,19 +574,26 @@ def members(bl):
 
 
 def probe_pinned_to_proxy(all_lines):
-    """ip.sb 这条规则必须指向 PROXY。
+    """ip.sb 这条规则必须指向 PROXY，且**所有**同名规则都要满足。
 
     逐行扫而不是正则匹配整段文本：rules 段里也有缩进注释和别的域名，
     正则容易匹配到注释里或别处去。
+
+    归一化必须与上面 members() 保持一致（同样要去掉行尾 # 注释和引号），
+    否则 `- DOMAIN-SUFFIX,ip.sb,PROXY  # 查出口 IP` 这种完全正确的写法
+    会被误判成 PROBE_ON_AUTOFALL，把人引向一个不存在的故障。
     """
+    found = False
     for ln in all_lines:
         s = ln.strip()
         if not s.startswith("- DOMAIN-SUFFIX"):
             continue
-        parts = [x.strip() for x in s.lstrip("- ").split(",")]
+        parts = [x.strip() for x in s.lstrip("- ").split("#", 1)[0].split(",")]
         if len(parts) == 3 and parts[1] == "ip.sb":
-            return parts[2] == "PROXY"
-    return False
+            found = True
+            if parts[2].strip('"').strip("'") != "PROXY":
+                return False
+    return found
 
 
 sn = block("sniffer:", 0)

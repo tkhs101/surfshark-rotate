@@ -39,15 +39,33 @@ say() { printf '[on-mihomo-up] %s\n' "$*"; }
 # 顺序有讲究：先确认 python3 和状态文件都在，再去问「是不是降级态」。
 # 反过来写的话，python3 缺失时会把 "-c" 当成命令去执行。
 [ -z "$PY3" ] && exit 0
-[ -f "$STATE" ] || exit 0
 
-"$PY3" -c 'import json,sys
+# 状态文件只有两种情况要继续往下走：
+#   · 明确写着 degraded        → 正常降级，检查是否恢复
+#   · 缺失 / 损坏 / 读不出来   → 仍要往下走，理由见下
+#
+# 【为什么后者不能直接 exit 0】降级时 AUTOFALL 是被我们设成 DIRECT 的，
+# 而 mihomo 会把这个 select 组的选择持久化到 cache.db。若此刻状态文件被删
+# 或损坏，degraded 标记就没了，但数据面上 opencode.ai 仍在用本机 IP 出网，
+# 而定时器早就被 mark_degraded 停掉了 —— 谁都不会再去看它一眼。
+# 早先这里直接 exit 0，等于让这种状态永久泄漏且无人察觉。
+# 所以读不出状态时继续往下走，改用数据面本身（AUTOFALL 实际指向谁）来判断。
+STATE_UNKNOWN=0
+if [ -f "$STATE" ]; then
+    "$PY3" -c 'import json,sys
 try:
     sys.exit(0 if json.load(open(sys.argv[1])).get("degraded") else 1)
 except Exception:
-    sys.exit(1)' "$STATE" 2>/dev/null || exit 0
+    sys.exit(2)' "$STATE" 2>/dev/null && exit 0
+    rc=$?
+    [ "$rc" = "2" ] && STATE_UNKNOWN=1
+else
+    STATE_UNKNOWN=1
+fi
 
-say "检测到降级态，检查节点是否已恢复…"
+if [ "$STATE_UNKNOWN" = "1" ]; then
+    say "状态文件缺失或损坏，改用数据面判断是否处于降级态…"
+fi
 
 [ -r "$CFG" ] || exit 0
 SECRET="$(sed -n 's/^secret:[[:space:]]*"\{0,1\}\([^"#]*\)"\{0,1\}[[:space:]]*$/\1/p' "$CFG" 2>/dev/null | head -1)"

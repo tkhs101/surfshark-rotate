@@ -32,12 +32,12 @@ try: print(json.load(sys.stdin).get("now") or "")
 except Exception: pass' 2>/dev/null)"
 fi
 if [ "$AF_NOW" = "DIRECT" ]; then
-    printf '\n\033[1;41m\033[97m  ⚠ 降级中：节点全挂，未走代理  \033[0m\n'
-    c_err  "  opencode.ai / ip.sb 已自动退到直连 —— 还能用，但出口是本机（$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)），"
+    printf '\n\033[1;41m\033[97m  ⚠ 降级中：节点不可用，opencode.ai 未走代理  \033[0m\n'
+    c_err  "  opencode.ai 已退到直连（脚本连续 2 轮取不到出口 IP，且控制面也探测不到节点）—— 还能用，但出口是本机（$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)），"
     c_err  "  IP 轮换已停摆，而轮换正是这个项目存在的理由。"
     c_err  "  常见原因：Surfshark WireGuard 私钥到期 / 被吊销 / 续费后换了新私钥没更新。"
     c_err  "  恢复：换新私钥 → sudo systemctl restart mihomo（钩子会自动启回轮换定时器）"
-    c_warn "  若 1 分钟内没自动恢复，手工执行：sudo systemctl start surfshark-rotate.timer"
+    c_warn "  若 2 分钟内没自动恢复，手工执行：sudo systemctl start surfshark-rotate.timer"
     echo
 fi
 

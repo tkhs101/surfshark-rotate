@@ -392,18 +392,23 @@ def clear_degraded(state):
         log("    AUTOFALL 已切回 PROXY，opencode.ai 恢复走轮换 IP")
 
     # mark_degraded 停掉了定时器，所以「轮换恢复」这句话成立的前提是
-    # 定时器确实还活着。降级后若只跑了手工的一轮、mihomo 没重启过，
-    # 钩子就不会触发，定时器仍然是停的 —— 这时必须说出来，
-    # 否则日志显示一切正常，而轮换其实已经不会再自己跑。
-    timer_alive = False
-    if os.path.exists("/run/systemd/system"):
-        timer_alive = subprocess.run(["systemctl", "is-active", ROTATE_TIMER],
-                                     capture_output=True, text=True).stdout.strip() == "active"
-    if timer_alive:
-        log("    已退出降级态，轮换恢复")
+    # 定时器真的还活着。而恢复有两条路径，只有钩子那条会顺带 systemctl start：
+    #   · 换私钥 → restart mihomo → on-mihomo-up.sh 起定时器
+    #   · 手工跑一轮 rotate.py（本函数的调用点）→ 钩子根本不触发
+    # 第二条路径下定时器仍然是停的，而轮换正是这个项目唯一的产出 ——
+    # 实测出现过：换回私钥、重启过、也手工跑过一轮，定时器还是 inactive，
+    # 轮换从此静默停摆，日志却一切正常。
+    # 所以这里主动把定时器启回来，而不是只提醒一句「需要手工执行」。
+    if not os.path.exists("/run/systemd/system"):
+        log("    已退出降级态（非 systemd 环境，定时器由人管）")
+        return
+    r = subprocess.run(["systemctl", "start", ROTATE_TIMER],
+                       capture_output=True, text=True, timeout=30)
+    if r.returncode == 0:
+        log("    已退出降级态，并已启回 %s —— 轮换恢复" % ROTATE_TIMER)
     else:
-        log(f"    已退出降级态，但 {ROTATE_TIMER} 仍是停止的（降级时已被停掉）")
-        log(f"    定时器不会自己回来，需要手工执行：sudo systemctl start {ROTATE_TIMER}")
+        log(f"    已退出降级态，但启回 {ROTATE_TIMER} 失败：{(r.stderr or '').strip()[:160]}")
+        log(f"    请手工执行：sudo systemctl start {ROTATE_TIMER}")
 
 
 def heal_mihomo():
@@ -575,13 +580,35 @@ def rotate_once(dry_run=False):
         streak = int(state.get("fail_streak") or 0) + 1
         state["fail_streak"] = streak
         log(f"    出口IP：{old_ip or '(未知)'} -> (取不到)   连续第 {streak} 次失败")
-        if streak >= DEGRADE_AFTER_FAILS:
-            log(f"    连续 {streak} 轮取不到出口 IP —— 判定节点全挂")
-            return mark_degraded(state, f"连续 {streak} 轮取不到出口 IP")
         # last_ip 必须保留上一次已知的正常出口。
         # 写成 None 的话，等密钥换好之后 old_ip 为空，
         # 「IP 没变就降档」的判断会被跳过，分档逻辑整个失准。
         state["last_ip"] = old_ip
+
+        if streak >= DEGRADE_AFTER_FAILS:
+            # 【必须用第二个信号佐证，否则降级会变成新的泄漏源】
+            # 上面那个失败只说明「ip.sb 这条探测通道没给出结果」，它与隧道
+            # 健康无关 —— ip.sb 限流、5xx、边缘拦截、TLS 抖动，全都落在同一个
+            # 分支里。实测 ip.sb 挂 5~10 分钟就能攒够 2 次，届时会把一条
+            # **完全健康**的隧道切到直连：opencode.ai 于是用本机 GCP 机房 IP
+            # 出网，正是这个项目要避免的事，而且比原来内核那次瞬时翻转更糟
+            # （那个 <1 秒，这个是两整轮、期间所有连接都算）。
+            #
+            # 所以降级必须与控制面结论一致：只有隧道本身也不通时才算降级。
+            # 这也符合「泄漏比失败更糟」的优先级 —— 隧道好着就不该降级，
+            # ip.sb 的问题下一轮自然就好了。
+            # 注意探的是 target 不是 live：此刻已经切换并热重载过，
+            # 当前生效的是 target，live 是刚被切走的旧节点。
+            if node_healthy(target):
+                log(f"    控制面判定节点仍可用 —— 隧道没坏，是探测通道（ip.sb）的问题，不降级")
+                log(f"    fail_streak 清零，last_ip 保留为 {old_ip or '(未知)'}")
+                state["fail_streak"] = 0
+                save_state(state)
+                log(f"--- 结束 | 节点={target} | 出口IP=(取不到，但隧道健康) | "
+                    f"未降级 ---")
+                return False
+            return mark_degraded(state, f"连续 {streak} 轮取不到出口 IP，且控制面也探测不到节点")
+
         save_state(state)
         log(f"--- 结束 | 节点={target} | 出口IP=(取不到) | "
             f"连续失败 {streak}/{DEGRADE_AFTER_FAILS} ---")
@@ -626,9 +653,12 @@ def show_status():
         + (f"  —— {st.get('degraded_reason') or now}（AUTOFALL={now}）" if degraded else ""))
     log(f"当前节点 : {node}")
     if degraded:
-        # 降级态下 ip.sb 也走直连，测回来的就是这台机器自己的公网 IP。
-        # 这正是「当前没走代理」的直接证据，比任何推断都硬。
-        log(f"出口 IP  : {ip or '(取不到)'}  ← 未走代理，这就是本机公网 IP")
+        # ip.sb 现在固定挂在 PROXY 上（不在降级链里），所以降级时探测它
+        # 必然失败、返回「取不到」—— 这本身就是「当前没走代理」的直接证据。
+        # 早先这里写的是「测回来的就是本机公网 IP」，那是 ip.sb 还挂在
+        # AUTOFALL 上时的行为，改规则后已经不成立了，留着会教错排查方向。
+        log(f"出口 IP  : (取不到)  ← 探测通道固定走 PROXY，隧道不通，"
+            f"这是「当前确实没走代理」的证据")
         log(f"停摆于   : {st.get('degraded_at') or '(未知)'}")
     else:
         log(f"出口 IP  : {ip or '(取不到)'}")
