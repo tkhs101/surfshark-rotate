@@ -7,6 +7,8 @@ set -uo pipefail
 
 BASE="/opt/surfshark-rotate"
 CFG="$BASE/config.yaml"
+STATE="$BASE/.rotate_state.json"
+PY3="$(command -v python3 || true)"
 
 c_ok()   { printf '\033[32m%s\033[0m\n' "$*"; }
 c_warn() { printf '\033[33m%s\033[0m\n' "$*"; }
@@ -34,8 +36,38 @@ if [ -n "$BASE_SECRET" ]; then
 try: print(json.load(sys.stdin).get("now") or "")
 except Exception: pass' 2>/dev/null)"
 fi
+# 从状态文件读降级起始时刻。永久泄漏最怕的不是发生，是没人知道它已经持续了
+# 两天 —— 一个只有「是/否」的状态无法区分「刚降级 40 秒」和「已经漏了三天」。
+DEG_AT=""
+DEG_AGE=""
+if [ -n "$PY3" ] && [ -f "$STATE" ]; then
+    DEG_AT="$("$PY3" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("degraded_at") or "")
+except Exception:
+    print("")' "$STATE" 2>/dev/null)"
+fi
+if [ -n "$DEG_AT" ]; then
+    DEG_AGE="$("$PY3" -c '
+import datetime, sys
+try:
+    t0 = datetime.datetime.strptime(sys.argv[1], "%Y-%m-%d %H:%M:%S")
+except Exception:
+    sys.exit(0)
+d = int((datetime.datetime.now() - t0).total_seconds())
+if d < 3600:
+    print("%d 分钟" % max(0, d // 60))
+else:
+    print("%d 小时 %d 分" % (d // 3600, (d % 3600) // 60))' "$DEG_AT" 2>/dev/null)"
+fi
 if [ "$AF_NOW" = "DIRECT" ]; then
-    printf '\n\033[1;41m\033[97m  ⚠ 降级中：节点不可用，opencode.ai 未走代理  \033[0m\n'
+    if [ -n "$DEG_AGE" ]; then
+        printf '\n\033[1;41m\033[97m  ⚠ 降级中 %s：节点不可用，opencode.ai 未走代理  \033[0m\n' "$DEG_AGE"
+    else
+        printf '\n\033[1;41m\033[97m  ⚠ 降级中：节点不可用，opencode.ai 未走代理  \033[0m\n'
+    fi
     c_err  "  opencode.ai 已退到直连（脚本连续 2 轮取不到出口 IP，且控制面也探测不到节点）—— 还能用，但出口是本机（$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null)），"
     c_err  "  IP 轮换已停摆，而轮换正是这个项目存在的理由。"
     c_err  "  常见原因：Surfshark WireGuard 私钥到期 / 被吊销 / 续费后换了新私钥没更新。"
@@ -62,6 +94,32 @@ for u in mihomo.service surfshark-rotate.timer surfshark-rotate.service; do
         *)        printf '  %-28s \033[33m%s\033[0m\n' "$u" "$st" ;;
     esac
 done
+
+# ------------------------------------------------------------
+#  停摆判据：唯一会打印误导性绿字的组合
+# ------------------------------------------------------------
+# 定时器 inactive 的原因通常是降级 —— 那是设计如此，横幅已经解释过。
+# 但只要 AUTOFALL 不在 DIRECT、状态文件也没有降级标记，「定时器停着」就意味着：
+# 轮换停了，而紧接着下面那一节会显示「上一轮轮换结果：成功」——
+# 唯一的产出为零，信号却是绿的。手工 stop、systemd-run 失败、单元被 masked
+# 都会落到这里。这里补一条红字，把这种组合从暗处搬到明处。
+TIMER_ST="$(systemctl is-active surfshark-rotate.timer 2>/dev/null | head -1)"
+DEG_FLAG=""
+if [ -n "$PY3" ] && [ -f "$STATE" ]; then
+    DEG_FLAG="$("$PY3" -c '
+import json, sys
+try:
+    print("true" if json.load(open(sys.argv[1])).get("degraded") else "false")
+except Exception:
+    print("")' "$STATE" 2>/dev/null)"
+fi
+if [ "$TIMER_ST" != "active" ] && [ "$AF_NOW" != "DIRECT" ] && [ "$DEG_FLAG" != "true" ]; then
+    printf '\n\033[1;41m\033[97m  ⚠ 轮换已停摆且不处于降级态  \033[0m\n'
+    c_err  "  定时器状态是「$TIMER_ST」，但降级标记为「否」—— 按设计，停表只会因为降级而发生。"
+    c_err  "  opencode.ai 仍走代理（没有泄漏），但 IP 已不会更新，轮换产出为零。"
+    c_err  "  恢复：sudo systemctl start surfshark-rotate.timer"
+    echo
+fi
 
 line "轮换定时器"
 # ------------------------------------------------------------

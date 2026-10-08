@@ -72,6 +72,7 @@ DEGRADED_TO = "DIRECT"
 # 连续多少轮取不到出口 IP 就判定为节点全挂。
 # 不能是 1：单轮取不到可能只是某个 CDN 边缘节点抖动。
 # 也不能太大：定时器 5 分钟一轮，3 轮就是 15 分钟无谓的空转。
+SAME_IP_WARN = 3            # 连续 3 轮出口 IP 不变 -> 产出为零，开始出声
 DEGRADE_AFTER_FAILS = 2
 
 # 恢复侧的去抖次数。
@@ -864,7 +865,17 @@ def rotate_once(dry_run=False):
         log("    IP 未变化 → 降到下一档备用节点")
         state["tier"] = tier + 1
         state["idx"] = 0
+        # 连续「取到了出口 IP、但和上次一样」的次数。
+        # 这是一个**产出为零但全绿**的状态：每轮都打印「完成」、退出码 0，
+        # 而项目唯一的存在理由（换 IP）没有任何进展。数据本来就在手里，
+        # 只差记一下让 status.sh 能看见。
+        unchanged = int(state.get("same_ip_streak") or 0) + 1
+        state["same_ip_streak"] = unchanged
+        if unchanged >= SAME_IP_WARN:
+            log(f"    ⚠ 连续 {unchanged} 轮取到的出口 IP 与上次相同 —— "
+                f"轮换产出为零。检查 status.sh 或换节点/换私钥。")
     else:
+        state["same_ip_streak"] = 0
         state["idx"] = state.get("idx", 0) + 1
         if tier > 0 and new_ip:
             # 备用档成功换到新 IP，就逐步升回低延迟档
@@ -872,7 +883,9 @@ def rotate_once(dry_run=False):
             log(f"    备用档成功 → 升回第 {state['tier']+1} 档")
 
     state["last_ip"] = new_ip
-    update_state({"last_ip": new_ip, "idx": state["idx"], "tier": state["tier"]})
+    update_state({"last_ip": new_ip, "idx": state["idx"],
+                  "tier": state["tier"],
+                  "same_ip_streak": state.get("same_ip_streak", 0)})
     log(f"--- 完成 | 节点={target} | IP={new_ip} | 档位={state['tier']+1} ---")
     return True
 
@@ -903,6 +916,14 @@ def show_status():
     else:
         log(f"出口 IP  : {ip or '(取不到)'}")
     log(f"上次 IP  : {st.get('last_ip') or '(无记录)'}")
+    streak = int(st.get("same_ip_streak") or 0)
+    if streak >= SAME_IP_WARN:
+        log(f"⚠ 轮换产出 : 连续 {streak} 轮出口 IP 与上次相同 —— "
+            f"在换节点但没换到不同出口。项目唯一产出为零。")
+    elif ip and st.get("last_ip") and ip == st["last_ip"]:
+        log(f"轮换产出 : 本轮与上次相同（累计 {streak}，满 {SAME_IP_WARN} 轮告警）")
+    else:
+        log(f"轮换产出 : 正常（本轮 {ip or '(未知)'}）")
     log(f"该节点连接 : {conns_on(node)}")
     log(f"当前档位 : {st.get('tier', 0)+1} / {len(TIERS)}")
     log(f"配置路径 : {CONFIG_PATH} ({'存在' if os.path.exists(CONFIG_PATH) else '不存在'})")
