@@ -457,10 +457,11 @@ def direct_leaks():
     return hits
 
 
-_IP_CACHE = {"at": 0.0, "ips": set()}
+_IP_CACHE = {"at": 0.0, "ips": set(), "ok": False}
+_IP_TTL_OK, _IP_TTL_BAD = 900, 60
 
 
-def _leak_ips(ttl=900):
+def _leak_ips(ttl=None):
     """opencode.ai 当前解析到的 IP 集合，带 TTL 缓存。
 
     Cloudflare 前端，地址会变，所以带 TTL 而不是写死。但缓存是为了不每轮
@@ -469,22 +470,39 @@ def _leak_ips(ttl=900):
     一次解析失败就把正在泄漏的连接全判成无关。
     """
     now = time.time()
+    if ttl is None:
+        ttl = _IP_TTL_OK if _IP_CACHE["ok"] else _IP_TTL_BAD
     if now - _IP_CACHE["at"] < ttl:
         return _IP_CACHE["ips"]
-    ips = set()
+    ips, resolved = set(), False
     try:
         for fam in (socket.AF_INET, socket.AF_INET6):
             try:
                 for r in socket.getaddrinfo(LEAK_HOST, 443, fam):
                     ips.add(r[4][0])
+                    resolved = True
             except OSError:
                 pass
     except Exception:
         pass
-    if ips:
-        _IP_CACHE["ips"] = ips
-        _IP_CACHE["at"] = now
+    # 时间戳**无条件**更新 —— 早先只在解析成功时更新，于是持续失败时
+    # TTL 对失败路径完全失效，每轮都重试 DNS（实测 4 次调用 4 次 DNS）。
+    # 失败时保留上一份好缓存，而不是退化成空集：宁可多看几条，
+    # 也不要因为一次解析失败就把正在泄漏的连接全判成无关。
+    _IP_CACHE.update(at=now,
+                     ips=ips or _IP_CACHE["ips"],
+                     ok=resolved or _IP_CACHE["ok"])
     return _IP_CACHE["ips"]
+
+
+def _leak_ip_lookup_ok():
+    """按 IP 匹配这一路当前是否可用。
+
+    sniffer 失效正是 direct_leaks 被引入 IP 反查要覆盖的场景；
+    而解析失败时它会静默退化成「只按域名匹配」，于是**对它自己的目标失明**，
+    且没有任何输出告诉人。show_status 用它把这件事说出来。
+    """
+    return _IP_CACHE["ok"]
 
 
 def conns_on(node):
@@ -1250,6 +1268,9 @@ def show_status():
         log(f"泄漏检测 : {len(leaks)} 条走 DIRECT —— 降级期间属预期，非异常")
     else:
         log(f"泄漏检测 : 未发现 {LEAK_HOST} 走直连")
+    if not _leak_ip_lookup_ok():
+        log(f"IP 反查  : 不可用（{LEAK_HOST} 解析失败）—— 本次判定只按域名匹配，")
+        log("           而 sniffer 失效正是要覆盖的场景之一。")
     log(f"当前档位 : {st.get('tier', 0)+1} / {len(TIERS)}")
     log(f"配置路径 : {CONFIG_PATH} ({'存在' if os.path.exists(CONFIG_PATH) else '不存在'})")
 

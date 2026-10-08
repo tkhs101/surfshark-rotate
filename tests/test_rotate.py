@@ -969,6 +969,94 @@ class TestLeakCountContract(RotateTestBase):
                       "变量会是多行日志 + skip")
 
 
+class TestLeakIpTtl(RotateTestBase):
+    """解析失败时 TTL 不能失效，也不能静默把检测器变瞎。"""
+
+    def test_timestamp_updates_even_when_resolution_fails(self):
+        import socket as _s
+        self.rotate._IP_CACHE.update(at=0.0, ips=set(), ok=False)
+        calls = []
+        real = _s.getaddrinfo
+        def boom(*a, **k):
+            calls.append(1)
+            raise _s.gaierror("boom")
+        _s.getaddrinfo = boom
+        try:
+            for _ in range(4):
+                self.rotate._leak_ips()
+        finally:
+            _s.getaddrinfo = real
+        self.assertEqual(len(calls), 1,
+                         "持续失败时每轮重试 DNS —— TTL 对失败路径失效了")
+
+    def test_keeps_previous_good_cache_on_failure(self):
+        import socket as _s
+        self.rotate._IP_CACHE.update(at=0.0, ips={"1.2.3.4"}, ok=True)
+        real = _s.getaddrinfo
+        _s.getaddrinfo = lambda *a, **k: (_ for _ in ()).throw(_s.gaierror())
+        try:
+            ips = self.rotate._leak_ips()
+        finally:
+            _s.getaddrinfo = real
+        self.assertIn("1.2.3.4", ips, "一次解析失败不该把缓存清空")
+
+    def test_status_reports_when_by_ip_is_unavailable(self):
+        """检测器对它自己的目标静默失明，必须看得见。"""
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        self.assertIn("IP 反查", src,
+                      "按 IP 匹配失效时必须在状态里说出来")
+
+
+class TestRecheckCounterCarrier(unittest.TestCase):
+    """复查计数搬进 argv：状态文件丢了也要能跑满 6 跳。
+
+    旧实现把计数记在状态文件里，于是「状态文件丢失」时计数无处可记 ——
+    NEXT 恒为 1、单元名恒为 resume-1，复查链在第 1 跳就死。而那条路径
+    正是「状态丢了也能自愈」的兜底，兜底只剩一跳。
+    队友已实跑确认过搬进 argv 后连跑 8 跳正常收口；这里锁住形状。
+    """
+
+    def _src(self):
+        return (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+
+    def test_hop_argument_is_read(self):
+        self.assertIn('HOP="${2:-}"', self._src())
+
+    def test_hop_takes_precedence_over_state_file(self):
+        src = self._src()
+        i = src.index('case "$HOP"')
+        blk = src[i:i + 400]
+        self.assertIn('[ -n "$HOP" ]', blk,
+                      "链内跳必须以 argv 为准，否则状态文件丢失时又回到只剩一跳")
+
+    def test_next_is_passed_to_the_next_hop(self):
+        self.assertIn('--resume "$NEXT"', self._src(),
+                      "每一跳必须把计数传给下一跳")
+
+    def test_unit_name_stays_unique_per_hop(self):
+        self.assertIn('--unit="surfshark-rotate-resume-$NEXT"', self._src())
+
+    def test_dirty_values_cannot_reach_arithmetic(self):
+        """$(( )) 里的语法错误是致命的（即使没有 set -e、即使 2>/dev/null）。
+
+        整脚本非零退出 -> ExecStartPost 非零 -> mihomo 判 failed + Restart=always。
+        """
+        src = self._src()
+        for v in ("TRIES", "HOP"):
+            self.assertIn('case "$%s"' % v, src,
+                          "%s 必须先净化再进算术展开" % v)
+
+    def test_empty_counter_does_not_stop_rechecking(self):
+        """计数没落盘时复查已经排上去了，不能说「停止自动复查」。"""
+        src = self._src()
+        i = src.index('if [ -z "$GOT" ]; then')
+        blk = src[i:i + 500]
+        self.assertNotIn("停止自动复查", blk,
+                         "空计数时复查已排上，说停止与行为相反")
+        self.assertNotIn("rotate.py 不可用", blk.split("elif")[0],
+                         "守卫正确地拒绝写入，归因不该说成 rotate.py 坏了")
+
+
 class TestHookInvariants(unittest.TestCase):
     """只保留**执行真实脚本**或**断言行为**的用例。
 

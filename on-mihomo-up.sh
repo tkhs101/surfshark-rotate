@@ -66,8 +66,17 @@ say() { printf '[on-mihomo-up] %s\n' "$*"; }
 # 于是又变回无限重排。而人工重试必须归零 —— 早先的提示语写「restart mihomo
 # （计数重置）」是错的：除了真的恢复，没有任何地方会清这个计数，
 # 它能一直停在上限值上，于是人工重试照样一次都不查。
+# --resume 表示「我是链上叫起来的」；$2 是**本链已经完成的跳数**。
+#
+# 计数为什么要搬进 argv：它本来记在状态文件里，于是「状态文件丢失」时
+# 计数无处可记 —— NEXT 恒为 1、单元名恒为 resume-1，复查链在第 1 跳就死。
+# 而那条路径正是「状态丢了也能自愈」的兜底，兜底只剩一跳。
+# 搬进 argv 之后，计数由**这一跳携带**，不再从共享文件重新推导，
+# 状态文件丢了照样能跑满 6 跳；状态文件里的 recheck_tries 退化成跨链的
+# 全局上限（重启机器不会被重置）。两条信号分工，而不是二选一。
 RESUMED=0
 [ "${1:-}" = "--resume" ] && RESUMED=1
+HOP="${2:-}"
 
 STATE_UNKNOWN=0
 if [ -f "$STATE" ]; then
@@ -176,7 +185,13 @@ try:
     print(int(json.load(open(p, encoding="utf-8")).get("recheck_tries") or 0))
 except Exception:
     print(0)' "$STATE" 2>/dev/null || echo 0)"
-    NEXT=$((TRIES + 1))
+    # 算术展开遇到非数字是致命错误，会让 ExecStartPost 非零退出 ->
+    # mihomo 判 failed + Restart=always。先净化再算。
+    case "$TRIES" in (''|*[!0-9]*) TRIES=0 ;; esac
+    case "$HOP"   in (''|*[!0-9]*) HOP=""  ;; esac
+    # 链内跳以 argv 为准（不依赖状态文件，这是它最大的好处）；
+    # 首次排程以状态文件为准（跨链累计，重启机器不会被重置）。
+    if [ -n "$HOP" ]; then NEXT=$((HOP + 1)); else NEXT=$((TRIES + 1)); fi
 
     if [ "$NEXT" -gt "$RECHECK_MAX" ]; then
         say "已复查 $TRIES 次仍未恢复，停止自动复查（不会有人来修的）"
@@ -242,7 +257,7 @@ except Exception:
         if ! systemd-run --quiet --collect \
                 --unit="surfshark-rotate-resume-$NEXT" \
                 --on-active="${RECHECK_DELAY}" \
-                /bin/bash "$BASE/on-mihomo-up.sh" --resume \
+                /bin/bash "$BASE/on-mihomo-up.sh" --resume "$NEXT" \
                 >/dev/null 2>&1; then
             say "复查排不起来（systemd 拒绝），停止自动复查"
             say "  修好之后请手工重试：sudo systemctl restart mihomo"
@@ -254,10 +269,14 @@ except Exception:
         # 这里**不能**写 || echo "$NEXT" —— 那会让 GOT 恒等于 NEXT，于是
         # 「写失败」的告警永远不触发；而写失败恰恰意味着上限永不生效
         # （rotate.py 坏掉时必然发生），也就正是最需要上限的时候。
-        if [ "$GOT" != "$NEXT" ]; then
-            say "⚠ 复查计数未能落盘（期望 $NEXT，实得 '${GOT:-空}'）—— 上限将失效，停止自动复查"
-            say "  原因通常是 rotate.py 不可用。修好之后手工重试：sudo systemctl restart mihomo"
-            exit 0
+        # 这里**不**因为计数没落盘就停掉复查 —— 复查在上一行的 systemd-run
+        # 已经排上去了，说「停止」与行为相反。
+        if [ -z "$GOT" ]; then
+            say "· 复查计数无处可记（状态文件不存在或损坏）—— rotate.py 按设计不写"
+            say "  一个读不出来的状态文件。复查本身继续，上限由本链自己数。"
+        elif [ "$GOT" != "$NEXT" ]; then
+            say "⚠ 复查计数未能落盘（期望 $NEXT，实得 '$GOT'）—— 跨链上限可能失效"
+            say "  多半是 rotate.py 不可用。复查本身继续；修好之后手工重试。"
         fi
     else
         say "systemd-run 不可用，请手工执行 systemctl start $TIMER"
