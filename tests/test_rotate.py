@@ -550,6 +550,16 @@ class TestLeakDetection(RotateTestBase):
         self.assertEqual(len(self.rotate.direct_leaks()), 1,
                          "sniffer 还原出的域名也要认 —— 那正是失效模式本身")
 
+    def _fake_leak_ip(self):
+        """注入一个确定的 opencode.ai IP，让匹配逻辑的测试不依赖真 DNS。
+
+        `_leak_ips` 是带 TTL 的缓存，直接把缓存填掉即可 —— 我们测的是
+        `direct_leaks()` 拿 IP 去比的那一步，不是 DNS 本身。
+        """
+        ip = "203.0.113.77"          # RFC 5737 文档保留段，真实路由不到
+        self.rotate._IP_CACHE.update(at=float("inf"), ips={ip}, ok=True)
+        return ip
+
     def test_sniffer_failure_is_detected_by_ip(self):
         """**这是这条检测被写出来要覆盖的失效模式本身。**
 
@@ -558,10 +568,7 @@ class TestLeakDetection(RotateTestBase):
         于是对它自己的目标失明：实测返回 []。必须按 IP 反查才能抓到。
         """
         self.seed()
-        ips = self.rotate._leak_ips()
-        if not ips:
-            self.skipTest("本机解析不到 opencode.ai，无法构造这个用例")
-        real_ip = sorted(ips)[0]
+        real_ip = self._fake_leak_ip()
         FakeMihomo.connections = [
             {"metadata": {"host": "", "sniffHost": "", "destinationIP": real_ip},
              "chains": ["DIRECT"]}]
@@ -573,14 +580,26 @@ class TestLeakDetection(RotateTestBase):
     def test_proxied_connection_not_flagged_even_with_bare_ip(self):
         """反向误报检查：走代理的同 IP 连接不该被报成泄漏。"""
         self.seed()
-        ips = self.rotate._leak_ips()
-        if not ips:
-            self.skipTest("本机解析不到 opencode.ai")
         FakeMihomo.connections = [
             {"metadata": {"host": "", "sniffHost": "",
-                          "destinationIP": sorted(ips)[0]},
+                          "destinationIP": self._fake_leak_ip()},
              "chains": ["JP 日本-东京", "PROXY", "AUTOFALL"]}]
         self.assertEqual(self.rotate.direct_leaks(), [])
+
+    def test_real_dns_resolution_actually_works(self):
+        """**集成检查**，会因环境而 skip —— 所以它刻意与上面两条分开。
+
+        上面两条测的是 `direct_leaks()` 的**匹配逻辑**，不需要真 DNS；
+        早先它们直接调 `_leak_ips()`，于是离线环境下唯一覆盖
+        「sniffer 失效」这条最危险检测路径的用例会 skipTest ——
+        而「测试全绿」在离线环境里并不等于覆盖到了它。
+        """
+        ips = self.rotate._leak_ips()
+        if not ips:
+            self.skipTest("本机解析不到 opencode.ai（这是集成检查，环境所致）")
+        self.assertTrue(all(isinstance(x, str) for x in ips))
+        for ip in ips:
+            self.assertIsInstance(self.rotate.socket.inet_aton(ip), bytes)
 
     def test_returns_none_when_api_unreachable(self):
         self.seed()
@@ -1327,6 +1346,83 @@ class TestHookInvariants(unittest.TestCase):
         """
         src = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
         self.assertNotIn('--recheck-tried 2>/dev/null || echo "$NEXT"', src)
+
+
+class TestSnifferCoverageNeverSkips(unittest.TestCase):
+    """「最危险的检测路径」不得因环境而消失。
+
+    sniffer 失效（无域名、纯 IP 落进 MATCH,DIRECT）是这条检测被写出来要覆盖的
+    失效模式本身。早先覆盖它的两条用例直接调 `_leak_ips()`，于是离线或受限
+    网络下会 skipTest —— 而「测试全绿」在那种环境里**并不等于**覆盖到了它。
+    典型场景：CI、容器、还没联网的新机器。
+    """
+
+    def _method_src(self, name):
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        i = src.index("def %s(self)" % name)
+        j = src.find(chr(10) + "    def ", i + 1)
+        return src[i:j if j > 0 else len(src)]
+
+    def test_sniffer_detection_tests_do_not_skip(self):
+        for name in ("test_sniffer_failure_is_detected_by_ip",
+                     "test_proxied_connection_not_flagged_even_with_bare_ip"):
+            blk = self._method_src(name)
+            self.assertNotIn("skipTest", blk,
+                             "%s 覆盖的是最危险的检测路径，不许因环境而跳过" % name)
+
+    def test_they_inject_the_ip_instead_of_resolving(self):
+        for name in ("test_sniffer_failure_is_detected_by_ip",
+                     "test_proxied_connection_not_flagged_even_with_bare_ip"):
+            blk = self._method_src(name)
+            self.assertNotIn("_leak_ips()", blk,
+                             "%s 不该依赖真 DNS" % name)
+
+    def test_real_dns_check_is_labelled_as_integration(self):
+        """真实解析那条保留为集成检查，且必须自我标注。"""
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        self.assertIn("test_real_dns_resolution_actually_works", src)
+        blk = self._method_src("test_real_dns_resolution_actually_works")
+        self.assertIn("集成检查", blk,
+                      "允许 skip 的那条必须明确标注自己是集成检查")
+
+
+class TestRunnerOrder(unittest.TestCase):
+    """测试类必须定义在 runner **之前**，否则从未执行。
+
+    我把一个类追加到文件末尾时踩过：它在 `unittest.main()` 调用**之后**才定义，
+    于是收集时不存在 —— **看起来有测试，实际没有**，比同义反复更隐蔽：
+    连 `FAILED` 都不会有，一直是全绿。
+    """
+
+    def test_no_test_class_is_defined_after_the_runner(self):
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        runner = src.index('if __name__ == "__main__":')
+        tail = src[runner:]
+        import re as _r
+        classes = _r.findall(r"^class (Test\w+)", tail, _r.M)
+        self.assertEqual(classes, [],
+                         "这些测试类定义在 runner 之后，从未执行：%s" % classes)
+
+    def test_every_class_is_discoverable(self):
+        """确认套件里真的装得下这些类（防止类名写错而静默不收）。"""
+        import unittest as _u
+        loader = _u.TestLoader()
+        suite = loader.discover(str(pathlib.Path(__file__).parent),
+                                pattern="test_rotate.py")
+        names = set()
+        def walk(s):
+            for t in s:
+                if isinstance(t, _u.TestSuite):
+                    walk(t)
+                else:
+                    names.add(type(t).__name__)
+        walk(suite)
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        import re as _r
+        declared = set(_r.findall(r"^class (Test\w+)", src, _r.M))
+        missing = declared - names
+        self.assertEqual(missing, set(),
+                         "这些测试类没有被 loader 收集到：%s" % sorted(missing))
 
 
 
