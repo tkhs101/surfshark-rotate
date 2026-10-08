@@ -738,7 +738,7 @@ def load_state():
         return {"tier": 0, "idx": 0, "last_ip": None}
 
 
-def update_state(patch=None, remove=(), incr=None):
+def update_state(patch=None, remove=(), incr=None, require_existing=False):
     """在同一个锁内完成「读 -> 改 -> 写」，并返回磁盘上的最终状态。
 
     【为什么是独立原语】读-改-写必须整体在同一个锁内，
@@ -752,6 +752,21 @@ def update_state(patch=None, remove=(), incr=None):
     patch 只写它列出的键，remove 只删它列出的键，两者都不碰其余字段。
     """
     def _apply():
+        # require_existing：**读不到就别写**。
+        # 物化的危险在 update_state 本身，不在某个调用方 ——
+        # 早先只在 reset_recheck_tries 里加了守卫，兄弟路径
+        # bump_recheck_tries 没有，于是同一个 P0 泄漏链照样成立：
+        # 钩子一边打印「状态文件缺失，改用数据面判断」，
+        # 一边把这个判断的前提凭空创建出来，下一次运行闸门就零输出返回，
+        # 「状态丢失 -> 自修」永久失效。守卫必须在这里。
+        if require_existing:
+            if not os.path.exists(STATE_FILE):
+                return None
+            try:
+                with open(STATE_FILE, encoding="utf-8") as f:
+                    json.load(f)          # 损坏就别覆盖，那是唯一的证据
+            except Exception:
+                return None
         cur = load_state()
         if not isinstance(cur, dict):
             cur = {}
@@ -765,6 +780,8 @@ def update_state(patch=None, remove=(), incr=None):
 
     if fcntl is None:
         final = _apply()
+        if final is None:
+            return None
         _write_atomic(final)
         return final
     lock_path = STATE_FILE + ".lock"
@@ -772,12 +789,16 @@ def update_state(patch=None, remove=(), incr=None):
         fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
     except OSError:
         final = _apply()
+        if final is None:
+            return None
         _write_atomic(final)
         return final
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
         try:
             final = _apply()
+            if final is None:
+                return None
             _write_atomic(final)      # 同样必须在临界区内
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
@@ -851,7 +872,10 @@ def bump_recheck_tries():
     逻辑，重复一次就多一个能把它写坏的版本。增也在锁内完成 —— 读加写分开
     的话，两个并发调用会拿到同一个新值。
     """
-    return int(update_state(incr={"recheck_tries": 1}).get("recheck_tries") or 0)
+    final = update_state(incr={"recheck_tries": 1}, require_existing=True)
+    if final is None:
+        return None          # 状态文件读不出来：一个字都不写
+    return int(final.get("recheck_tries") or 0)
 
 
 def reset_recheck_tries():
@@ -866,14 +890,7 @@ def reset_recheck_tries():
     路径永远走不到，AUTOFALL 停在 DIRECT 不动。上机实测确认过这条泄漏链。
     写一个状态文件不是「无害的准备工作」，它会改变下游的判读。
     """
-    if not os.path.exists(STATE_FILE):
-        return
-    try:
-        with open(STATE_FILE, encoding="utf-8") as f:
-            json.load(f)          # 损坏就别覆盖 —— 那是唯一的证据
-    except Exception:
-        return
-    update_state({"recheck_tries": 0})
+    update_state({"recheck_tries": 0}, require_existing=True)
 
 
 def pick_next(state):
@@ -1024,9 +1041,10 @@ def rotate_once(dry_run=False):
                       "routing_bad_reason": "; ".join(details)})
         raise SystemExit(3)
     if state.get("routing_bad_at"):
-        # 之前坏过、现在好了 —— 清掉标记，但记一条「曾异常过」的字样，
-        # 免得「曾经坏过」在状态里看起来像从未发生
-        update_state({"routing_bad_at": "", "routing_bad_reason": ""})
+        # 之前坏过、现在好了。用 remove 通道真正删掉这两个键 ——
+        # 置空串的话键会永久留在文件里，而空串与「从未发生过」在磁盘上
+        # 完全无法区分，那等于把刚建立的历史又抹掉一次。
+        update_state({}, remove=("routing_bad_at", "routing_bad_reason"))
         log("    分流规则已恢复正常（此前记录到异常）")
 
     # 3) 验证 IP
@@ -1212,7 +1230,8 @@ def main():
         return 0                 # 无论结果如何都返回 0：钩子必须永远返回 0
 
     if args.recheck_tried:
-        print(bump_recheck_tries())
+        n = bump_recheck_tries()
+        print("" if n is None else n)
         return 0
 
     if args.reset_recheck:

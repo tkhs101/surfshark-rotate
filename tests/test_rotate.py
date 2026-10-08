@@ -758,6 +758,49 @@ class TestTriStateVerdict(unittest.TestCase):
                       "门必须用 DEG_FLAG；用 AF_NOW 会在钩子恢复窗口里自相矛盾")
 
 
+class TestNoMaterialisation(RotateTestBase):
+    """**读不到状态就别写。** 物化的危险在 update_state 本身。
+
+    早先守卫只加在 reset_recheck_tries 上，兄弟路径 bump_recheck_tries 没有 ——
+    于是同一个 P0 泄漏链照样成立：钩子一边打印「状态文件缺失，改用数据面判断」，
+    一边把这个判断的前提凭空创建出来；下一次运行闸门读到那份新建的（没有
+    degraded 键的）文件，判定「明确未降级」直接 exit 0，「状态丢失 -> 自修」
+    永久失效，AUTOFALL 停在 DIRECT 不动。评审用真实钩子端到端复现过。
+    """
+
+    def test_incr_does_not_create_missing_file(self):
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+        self.assertIsNone(self.rotate.bump_recheck_tries())
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists(),
+                         "--recheck-tried 不得凭空创建状态文件")
+
+    def test_reset_does_not_create_missing_file(self):
+        self.rotate.reset_recheck_tries()
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+
+    def test_corrupt_file_is_not_overwritten_by_either(self):
+        raw = '{"tier": 3, "last'
+        pathlib.Path(self.rotate.STATE_FILE).write_text(raw, encoding="utf-8")
+        self.rotate.bump_recheck_tries()
+        self.rotate.reset_recheck_tries()
+        self.assertEqual(pathlib.Path(self.rotate.STATE_FILE).read_text(encoding="utf-8"),
+                         raw, "损坏文件是唯一证据，不能被任何子命令覆盖")
+
+    def test_patch_still_creates_file_when_allowed(self):
+        """守卫不能连正常的首次写入也拦掉。"""
+        self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
+        self.rotate.update_state({"tier": 0, "last_ip": "1.1.1.1"})
+        self.assertTrue(pathlib.Path(self.rotate.STATE_FILE).exists())
+
+    def test_recovery_actually_removes_keys(self):
+        """置空串会让「曾经坏过」看起来像从未发生 —— 必须真删。"""
+        self.seed(routing_bad_at="2026-01-01 00:00:00", routing_bad_reason="x")
+        self.rotate.update_state({}, remove=("routing_bad_at", "routing_bad_reason"))
+        s = self.state()
+        self.assertNotIn("routing_bad_at", s)
+        self.assertNotIn("routing_bad_reason", s)
+
+
 class TestHookInvariants(unittest.TestCase):
     """只保留**执行真实脚本**或**断言行为**的用例。
 
