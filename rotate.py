@@ -323,13 +323,41 @@ def mark_degraded(state, reason):
 
 
 def clear_degraded(state):
-    if state.get("degraded") or state.get("fail_streak"):
-        state.pop("degraded", None)
-        state.pop("degraded_reason", None)
-        state.pop("degraded_at", None)
-        state["fail_streak"] = 0
-        save_state(state)
+    """取到出口 IP 后清掉降级痕迹，并把日志说准确。
+
+    两种情况必须分开说：
+      · 真的进过降级态（AUTOFALL 落到 DIRECT，定时器已被停掉）
+      · 只是探测失败计数被清零，从没进过降级态
+    早先两者共用一句「已退出降级态」。实测遇到过「单轮探测失败
+    fail_streak 1/2 就恢复了」的情况，那句话把严重程度夸大了。
+    """
+    was_degraded = bool(state.get("degraded"))
+    streak = int(state.get("fail_streak") or 0)
+    if not (was_degraded or streak):
+        return
+    state.pop("degraded", None)
+    state.pop("degraded_reason", None)
+    state.pop("degraded_at", None)
+    state["fail_streak"] = 0
+    save_state(state)
+
+    if not was_degraded:
+        log(f"    出口 IP 已恢复（此前连续 {streak} 轮取不到），轮换继续")
+        return
+
+    # mark_degraded 停掉了定时器，所以「轮换恢复」这句话成立的前提是
+    # 定时器确实还活着。降级后若只跑了手工的一轮、mihomo 没重启过，
+    # 钩子就不会触发，定时器仍然是停的 —— 这时必须说出来，
+    # 否则日志显示一切正常，而轮换其实已经不会再自己跑。
+    timer_alive = False
+    if os.path.exists("/run/systemd/system"):
+        timer_alive = subprocess.run(["systemctl", "is-active", ROTATE_TIMER],
+                                     capture_output=True, text=True).stdout.strip() == "active"
+    if timer_alive:
         log("    已退出降级态，轮换恢复")
+    else:
+        log(f"    已退出降级态，但 {ROTATE_TIMER} 仍是停止的（降级时已被停掉）")
+        log(f"    定时器不会自己回来，需要手工执行：sudo systemctl start {ROTATE_TIMER}")
 
 
 def heal_mihomo():
