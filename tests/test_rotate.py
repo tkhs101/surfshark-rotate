@@ -1215,6 +1215,32 @@ class TestUninstallPurge(unittest.TestCase):
                              "恢复只由 rotate.py 显式切换" % bad)
 
 
+class TestRotationOutputHonesty(unittest.TestCase):
+    """--status 不得拿实时探测去比 last_ip。
+
+    每次**成功**轮换之后 last_ip 就是当前出口 IP，所以那句「本轮与上次相同」
+    **在健康路径上也会亮**；而「累计」取的是轮换记录的 same_ip_streak，
+    于是会出现「本轮与上次相同（累计 0）」这种自相矛盾的行。
+    真信号只有 same_ip_streak 一个。
+    """
+
+    def test_status_does_not_compare_live_probe_with_last_ip(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn("== st[\"last_ip\"]", code,
+                         "拿实时探测比 last_ip 在健康路径上必然为真 —— 是假告警")
+        self.assertNotIn("本轮与上次相同", code)
+
+    def test_streak_is_the_only_signal(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        self.assertIn("same_ip_streak", blk, "唯一的信号是轮换自己记的 streak")
+
+
 class TestHookInvariants(unittest.TestCase):
     """只保留**执行真实脚本**或**断言行为**的用例。
 

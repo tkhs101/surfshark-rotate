@@ -1273,14 +1273,21 @@ def show_status():
     else:
         log(f"出口 IP  : {ip or '(取不到)'}")
     log(f"上次 IP  : {st.get('last_ip') or '(无记录)'}")
+    # 【不要拿实时探测去比 last_ip】早先这里有一句
+    # 「本轮与上次相同（累计 N）」—— 那是在拿 --status 此刻的 exit_ip() 与
+    # last_ip 比。可每次**成功**轮换之后 last_ip 就是当前出口 IP，于是这句话
+    # **在健康路径上也会亮**；更糟的是「累计」取的是 same_ip_streak，
+    # 它只在轮换里递增，于是出现「本轮与上次相同（累计 0）」这种自相矛盾的行。
+    #
+    # 真正的信号只有 same_ip_streak 一个：它是轮换自己记的、跨轮可比的。
     streak = int(st.get("same_ip_streak") or 0)
     if streak >= SAME_IP_WARN:
-        log(f"⚠ 轮换产出 : 连续 {streak} 轮出口 IP 与上次相同 —— "
-            f"在换节点但没换到不同出口。项目唯一产出为零。")
-    elif ip and st.get("last_ip") and ip == st["last_ip"]:
-        log(f"轮换产出 : 本轮与上次相同（累计 {streak}，满 {SAME_IP_WARN} 轮告警）")
+        log(f"⚠ 轮换产出 : 连续 {streak} 轮出口 IP 未变（满 {SAME_IP_WARN} 轮告警）—— "
+            f"在换节点但没换到不同出口，项目唯一产出为零")
+    elif streak:
+        log(f"轮换产出 : 最近 {streak} 轮出口 IP 未变（满 {SAME_IP_WARN} 轮告警）")
     else:
-        log(f"轮换产出 : 正常（本轮 {ip or '(未知)'}）")
+        log(f"轮换产出 : 正常（最近一轮换到了新 IP）")
     log(f"该节点连接 : {conns_on(node)}")
     # 未降级却出现 opencode.ai 走 DIRECT = 正在泄漏，且没有任何其它信号能看见
     leaks = direct_leaks()
