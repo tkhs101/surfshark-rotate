@@ -911,6 +911,36 @@ def clear_degraded_flags():
     return True
 
 
+# 钩子（ExecStartPost）的最坏耗时预算。
+#
+# 【为什么要有这个可执行的数】钩子的最坏耗时随「端点数 × 采样次数」线性增长，
+# 而 mihomo.service 的 TimeoutStartSec 是 300s。越线的后果不是「少查一次」，
+# 而是钩子被 systemd 杀掉 -> mihomo 判 failed -> Restart=always 反复重启
+# 一台内核完全健康的服务，恢复路径永远跑不完。
+#
+# 早先这个耦合只存在于一段注释里，而那段注释的数字在改完超时后就已经过时 ——
+# 也就是说「还剩多少余量」这个事实没有任何东西在守着。加第 4 个端点时不会有
+# 任何信号告诉你预算快满了。现在它是常量算出来的，并由测试对照 TimeoutStartSec。
+HOOK_READY_TRIES = 30          # 钩子开头等 mihomo API 就绪的次数
+HOOK_READY_CURL = 2             # 每次 curl 的 --max-time
+HOOK_PUT_TIMEOUT = 10           # AUTOFALL 的 PUT urlopen timeout
+# api() 的默认 timeout 是 15（rotate.py 里 api(path, method, body, timeout=15)）
+
+
+def hook_worst_case_seconds(probes=2, gap=8):
+    """ExecStartPost 的最坏耗时上限（秒）。常量只有这一个 owner。"""
+    per_endpoint = NODE_HEALTH_TIMEOUT_MS / 1000.0 + NODE_HEALTH_CLIENT_SLACK
+    # node_healthy 顺序试 N 个端点（全挂才付满），另加一次只为取延迟的调用
+    per_probe = (len(NODE_HEALTH_URLS) + 1) * per_endpoint
+    # api() 的默认 timeout 写死 15，这里引同一个值而不是另抄一份
+    api_call = 15
+    probe_phase = (api_call + max(1, probes) * per_probe
+                   + (max(1, probes) - 1) * gap + api_call)
+    ready = HOOK_READY_TRIES * (HOOK_READY_CURL + 1)
+    return ready + probe_phase + HOOK_PUT_TIMEOUT + 5
+
+
+
 def bump_recheck_tries():
     """复查计数 +1，返回新值。给 on-mihomo-up.sh 用。
 
@@ -1283,6 +1313,8 @@ def main():
     ap.add_argument("--no-heal", action="store_true", help="mihomo 挂了不自愈（调试用）")
     ap.add_argument("--clear-degraded", action="store_true",
                     help="只清降级痕迹（供 on-mihomo-up.sh 调用）")
+    ap.add_argument("--hook-worst-case", action="store_true",
+                    help="打印钩子最坏耗时（秒），供预算核对")
     ap.add_argument("--leak-count", action="store_true",
                     help="打印当前正在走直连的 opencode.ai 连接数（供 status.sh 调用）")
     ap.add_argument("--probe-node", action="store_true",
@@ -1301,6 +1333,10 @@ def main():
     # on-mihomo-up.sh 曾经自带一份硬编码的 key 列表来清状态，于是状态 schema
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
+    if args.hook_worst_case:
+        print(int(hook_worst_case_seconds() + 0.999))
+        return 0
+
     if args.leak_count:
         # 契约：**永远 exit 0**，判据失效只体现在 stdout 上。
         # 早先失败时 print("skip") 且 return 1，而调用方写的是

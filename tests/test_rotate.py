@@ -1071,6 +1071,73 @@ class TestRecheckCounterCarrier(unittest.TestCase):
                          "守卫正确地拒绝写入，归因不该说成 rotate.py 坏了")
 
 
+class TestHookBudget(unittest.TestCase):
+    """钩子最坏耗时 vs mihomo.service 的 TimeoutStartSec。
+
+    这个耦合早先只存在于一段注释里，而那段注释的数字在改完超时后就已经过时
+    —— 也就是说「还剩多少余量」没有任何东西在守着。越线的后果不是「少查一次」，
+    而是钩子被 systemd 杀掉 -> mihomo 判 failed -> Restart=always 反复重启
+    一台内核完全健康的服务。
+
+    本轮实测值 199s（队友第四轮独立实测也是 199s，两边吻合）。
+    """
+
+    def _timeout_start_sec(self):
+        txt = (ROOT / "mihomo.service").read_text(encoding="utf-8")
+        m = __import__("re").search(r"TimeoutStartSec=(\d+)", txt)
+        self.assertIsNotNone(m, "mihomo.service 必须显式声明 TimeoutStartSec")
+        return int(m.group(1))
+
+    def test_current_budget_fits(self):
+        import rotate as _r
+        worst = _r.hook_worst_case_seconds()
+        limit = self._timeout_start_sec()
+        self.assertLess(worst, limit * 0.9,
+                        "钩子最坏 %.0fs 逼近 TimeoutStartSec=%ds" % (worst, limit))
+
+    def test_hook_probes_default_matches_rotate(self):
+        """钩子显式传的 --probes/--gap 必须与 rotate.py 的默认值一致。
+
+        不一致的话预算算的是两个不同的数，这个测试也就失去意义。
+        """
+        import rotate as _r
+        hook = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        import re
+        probes = re.search(r"HEALTH_PROBES=(\d+)", hook)
+        gap = re.search(r"HEALTH_GAP=(\d+)", hook)
+        self.assertIsNotNone(probes)
+        self.assertIsNotNone(gap)
+        sig = __import__("inspect").signature(_r.hook_worst_case_seconds)
+        self.assertEqual(int(probes.group(1)), sig.parameters["probes"].default,
+                         "钩子的 HEALTH_PROBES 与预算函数默认值不一致")
+        self.assertEqual(int(gap.group(1)), sig.parameters["gap"].default,
+                         "钩子的 HEALTH_GAP 与预算函数默认值不一致")
+
+    def test_adding_endpoints_is_caught(self):
+        """加端点导致预算越线时，这条测试必须变红。"""
+        import rotate as _r
+        base = _r.NODE_HEALTH_URLS
+        try:
+            _r.NODE_HEALTH_URLS = tuple("http://x%d/" % i for i in range(10))
+            self.assertGreater(_r.hook_worst_case_seconds(),
+                               self._timeout_start_sec() * 0.9,
+                               "10 个端点应该越过 0.9 安全线；"
+                               "若没有，说明预算公式没跟着端点数走")
+        finally:
+            _r.NODE_HEALTH_URLS = base
+
+    def test_budget_is_monotonic_in_probe_count(self):
+        import rotate as _r
+        vals = [_r.hook_worst_case_seconds(probes=n) for n in (1, 2, 3, 4, 5)]
+        self.assertEqual(vals, sorted(vals), "预算必须随采样次数单调不减")
+
+    def test_subcommand_reports_the_number(self):
+        import rotate as _r
+        n = int(_r.hook_worst_case_seconds() + 0.999)
+        self.assertGreater(n, 0)
+        self.assertEqual(n, int(_r.hook_worst_case_seconds() + 0.999))
+
+
 class TestHookInvariants(unittest.TestCase):
     """只保留**执行真实脚本**或**断言行为**的用例。
 
