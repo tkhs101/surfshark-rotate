@@ -324,26 +324,77 @@ def set_autofall(target):
 
 # 节点健康探测用的 URL。只经由控制面的 /proxies/<节点>/delay 端点使用，
 # 不参与分流规则，所以与出口 IP 探测（ip.sb，经数据面）是两条独立通道。
-NODE_HEALTH_URL = "http://cp.cloudflare.com/"
+# 控制面健康信号用的探针端点。**必须保持多个且互相独立。**
+#
+# 之前只有 cp.cloudflare.com 一个。它一旦对该机房 IP 限流，node_healthy() 就
+# 恒为 False —— 而这个信号同时是「降级佐证」和「恢复判据」：
+#   · 降级侧：exit_ip() 也失败时，会被判定为隧道已死 -> 误降级 -> 泄漏
+#   · 恢复侧：探测永远失败 -> 恢复卡住 -> 泄漏持续
+# 第二种更要命：它不会报错、不会降级，只是**永远不再恢复**，机器安静地一直直连。
+#
+# 判据取「任一端点响应即视为隧道存活」而不是「全部响应」，这不是宽容，
+# 是因为两个方向的错误代价相反：误判隧道死会泄漏（本项目的头号问题），
+# 误判隧道活只是让 opencode.ai 撞一次失败的代理，不泄漏且下一轮就会纠正。
+# 用两三家互不相关的服务，把「误判隧道死」的概率压到需要三方同时出事。
+NODE_HEALTH_URLS = (
+    "http://cp.cloudflare.com/",          # Cloudflare
+    "http://www.gstatic.com/generate_204",  # Google
+    "http://detectportal.firefox.com/success.txt",  # Mozilla
+)
+NODE_HEALTH_TIMEOUT_MS = 5000           # 单个端点；任一成功即短路返回
 
 
-def node_healthy(node, timeout_ms=8000):
-    """探测某个节点本身是否可用。
+def node_healthy(node, timeout_ms=NODE_HEALTH_TIMEOUT_MS):
+    """探测某个节点本身是否可用。任一端点响应即算可用。
 
     【为什么不用 AUTOFALL 判断恢复】降级时 AUTOFALL 正是我们自己设成
     DIRECT 的，拿它判断恢复会自证循环。这里走控制面的
     /proxies/<name>/delay —— 完全不经过 AUTOFALL，也不经过数据面，
     所以 AUTOFALL 当前指向谁都不影响这个结论。
     """
-    try:
-        q = urllib.parse.quote(node, safe="")
-        u = urllib.parse.quote(NODE_HEALTH_URL, safe="")
-        d = api("/proxies/%s/delay?timeout=%d&url=%s"
-                % (q, timeout_ms, u), timeout=timeout_ms / 1000.0 + 10)
-        delay = d.get("delay")
-        return isinstance(delay, int) and delay > 0
-    except Exception:
-        return False
+    q = urllib.parse.quote(node, safe="")
+    # 顺序尝试、任一成功即短路返回：健康情况下只花一个请求，
+    # 只有「全挂」才付满 N × timeout 的代价。
+    for raw in NODE_HEALTH_URLS:
+        u = urllib.parse.quote(raw, safe="")
+        try:
+            d = api("/proxies/%s/delay?timeout=%d&url=%s"
+                    % (q, timeout_ms, u), timeout=timeout_ms / 1000.0 + 10)
+            delay = d.get("delay")
+            if isinstance(delay, int) and delay > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def probe_node_consecutive(want, gap):
+    """连续 want 次探测当前节点，全健康才返回 (True, 延迟)。给钩子用。
+
+    为什么归本模块所有：钩子早先是内嵌一份 python 副本，连探针 URL 都在那里
+    硬编码了一遍。同一套判据两份实现，迟早漂移 —— 而漂移的方向恰好是
+    「钩子那份还写着一个已经废弃的 URL」，表现为恢复永远判不健康。
+    中途任何一次失败即整体作废，避免对着一台还在抖的隧道下结论。
+    """
+    node = api("/proxies/PROXY").get("now") or ""
+    if not node:
+        return False, None
+    last = None
+    for i in range(max(1, want)):
+        if i:
+            time.sleep(gap)
+        if not node_healthy(node):
+            return False, None
+        try:                      # 只为把延迟显示在日志里，失败无所谓
+            u = urllib.parse.quote(NODE_HEALTH_URLS[0], safe="")
+            q = urllib.parse.quote(node, safe="")
+            d = api("/proxies/%s/delay?timeout=%d&url=%s"
+                    % (q, NODE_HEALTH_TIMEOUT_MS, u),
+                    timeout=NODE_HEALTH_TIMEOUT_MS / 1000.0 + 10)
+            last = d.get("delay")
+        except Exception:
+            pass
+    return True, last
 
 
 def mark_degraded(state, reason):
@@ -846,6 +897,10 @@ def main():
     ap.add_argument("--no-heal", action="store_true", help="mihomo 挂了不自愈（调试用）")
     ap.add_argument("--clear-degraded", action="store_true",
                     help="只清降级痕迹（供 on-mihomo-up.sh 调用）")
+    ap.add_argument("--probe-node", action="store_true",
+                    help="探测当前节点连续健康（供 on-mihomo-up.sh 调用）")
+    ap.add_argument("--probes", type=int, default=2, help="--probe-node 的采样次数")
+    ap.add_argument("--gap", type=int, default=8, help="--probe-node 的采样间隔秒")
     ap.add_argument("--recheck-tried", action="store_true",
                     help="复查计数 +1 并打印（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--reset-recheck", action="store_true",
@@ -858,6 +913,13 @@ def main():
     # on-mihomo-up.sh 曾经自带一份硬编码的 key 列表来清状态，于是状态 schema
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
+    if args.probe_node:
+        ok, delay = probe_node_consecutive(args.probes, args.gap)
+        if ok:
+            live = api("/proxies/PROXY").get("now") or ""
+            print("%s %s" % (live, delay))
+        return 0                 # 无论结果如何都返回 0：钩子必须永远返回 0
+
     if args.recheck_tried:
         print(bump_recheck_tries())
         return 0

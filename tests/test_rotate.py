@@ -31,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import urllib.parse
 import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -48,6 +49,7 @@ class FakeMihomo(BaseHTTPRequestHandler):
     groups = {}
     delays = {}
     requests = []
+    dead_urls = set()
 
     def _auth_ok(self):
         return self.headers.get("Authorization") == "Bearer testsecret"
@@ -69,9 +71,14 @@ class FakeMihomo(BaseHTTPRequestHandler):
         for name in self.groups:
             if self.path == "/proxies/" + name:
                 return self._send(200, dict(self.groups[name], type="Selector"))
-            if self.path.startswith("/proxies/") and self.path.endswith("/delay"):
-                from urllib.parse import unquote, urlparse
-                node = unquote(self.path.split("/proxies/")[1].split("/")[0])
+            if "/delay?" in self.path or self.path.endswith("/delay"):
+                from urllib.parse import parse_qs, unquote, urlparse
+                path_only = urlparse(self.path).path
+                node = unquote(path_only.split("/proxies/")[1].split("/")[0])
+                qs = parse_qs(urlparse(self.path).query)
+                probe_url = qs.get("url", [""])[0]
+                if probe_url in type(self).dead_urls:
+                    return self._send(504, {"message": "timeout"})
                 d = self.delays.get(node)
                 if d is None:
                     return self._send(504, {"message": "timeout"})
@@ -91,7 +98,7 @@ class FakeMihomo(BaseHTTPRequestHandler):
         except Exception as e:
             # urllib 对非 bytes 的 data 会在这里之前就炸；这里兜 JSON 层
             return self._send(400, {"message": "bad json: %s" % e})
-        name = self.path.split("/proxies/")[-1]
+        name = self.path.split("/proxies/")[-1].split("?")[0]
         g = self.groups.get(name)
         if not g or body.get("name") not in g.get("all", []):
             return self._send(400, {"message": "no such member"})
@@ -119,6 +126,7 @@ class RotateTestBase(unittest.TestCase):
         }
         FakeMihomo.delays = {"JP 日本-东京": 137, "KR 韩国-首尔": 42}
         FakeMihomo.requests = []
+        FakeMihomo.dead_urls = set()
 
         import rotate
         self.rotate = rotate
@@ -336,6 +344,55 @@ class TestDegradeCorroboration(RotateTestBase):
         s = self.state()
         self.assertTrue(s.get("degraded"))
         self.assertEqual(FakeMihomo.groups["AUTOFALL"]["now"], "DIRECT")
+
+
+class TestMultiUrlProbe(RotateTestBase):
+    """控制面探针：任一端点响应即算隧道存活。
+
+    单端点曾让 cp.cloudflare.com 单独承担降级佐证与恢复判据两件事 ——
+    它一旦被限流，恢复侧会永远判不健康，于是机器安静地一直直连：不报错、
+    不降级、只是再也不恢复。这里固定住多端点语义。
+    """
+
+    def test_all_urls_configured(self):
+        urls = self.rotate.NODE_HEALTH_URLS
+        self.assertGreaterEqual(len(urls), 2, "必须多于一个探针端点")
+        self.assertEqual(len(set(urls)), len(urls), "探针端点不该重复")
+        hosts = {urllib.parse.urlparse(u).netloc for u in urls}
+        self.assertGreaterEqual(len(hosts), 2, "探针应来自互不相关的服务")
+
+    def test_one_healthy_url_is_enough(self):
+        self.seed()
+        for u in self.rotate.NODE_HEALTH_URLS[1:]:
+            FakeMihomo.dead_urls.add(u)
+        self.assertTrue(self.rotate.node_healthy("JP 日本-东京"),
+                        "有一个端点活着就该算隧道可用")
+
+    def test_dead_only_when_all_urls_fail(self):
+        self.seed()
+        FakeMihomo.dead_urls = set(self.rotate.NODE_HEALTH_URLS)
+        self.assertFalse(self.rotate.node_healthy("JP 日本-东京"))
+
+    def test_dead_node_stays_dead(self):
+        """所有端点失败时仍然判死 —— 收敛探针不能把真故障一起放过。"""
+        self.seed()
+        FakeMihomo.delays = {}          # 节点全死
+        self.assertFalse(self.rotate.node_healthy("JP 日本-东京"))
+
+    def test_probe_node_subcommand_contract(self):
+        """钩子靠 --probe-node 的输出判恢复，格式变了就会静默永不恢复。"""
+        self.seed()
+        self.assertTrue(self.rotate.probe_node_consecutive(2, 0)[0])
+        FakeMihomo.dead_urls = set(self.rotate.NODE_HEALTH_URLS)
+        ok, _ = self.rotate.probe_node_consecutive(2, 0)
+        self.assertFalse(ok)
+
+    def test_hook_has_no_hardcoded_probe_url(self):
+        """钩子里再写一份 URL 就是漂移的起点。"""
+        src = (ROOT / "on-mihomo-up.sh").read_text(encoding="utf-8")
+        for u in self.rotate.NODE_HEALTH_URLS:
+            self.assertNotIn(u, src, "钩子里硬编码了探针 URL %s" % u)
+        self.assertIn("--probe-node", src)
 
 
 class TestHookShell(unittest.TestCase):

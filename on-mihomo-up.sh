@@ -126,53 +126,20 @@ done
 #
 # 连续采样 HEALTH_PROBES 次（中间隔 HEALTH_GAP 秒），全健康才算恢复 ——
 # 与 rotate.py 的 RECOVER_AFTER_HEALTHY 对称。单次侥幸成功不足以证明
-# 「真的修好了」：那次成功的对象是 cp.cloudflare.com，不是我们要保的出口。
+# 「真的修好了」：那次成功打通的只是某个探针站点，不是我们要保的那个出口。
 # 两次之间任何一个失败就整体作废，避免对着一台还在抖的隧道下结论。
 HEALTH_PROBES=2
 HEALTH_GAP=8
-RESULT="$("$PY3" - "$HEALTH_PROBES" "$HEALTH_GAP" <<'PY' 2>/dev/null
-import json, re, sys, time, urllib.parse, urllib.request
-cfg = open("/opt/surfshark-rotate/config.yaml", encoding="utf-8").read()
-sec = re.search(r'(?m)^\s*secret:\s*"?([^"#\s]+)"?\s*$', cfg)
-if not sec:
-    sys.exit(0)
-H = {"Authorization": "Bearer " + sec.group(1)}
-API = "http://127.0.0.1:9097"
-WANT = int(sys.argv[1]); GAP = int(sys.argv[2])
-
-
-def get(path, timeout=15):
-    req = urllib.request.Request(API + path, headers=H)
-    return json.load(urllib.request.urlopen(req, timeout=timeout))
-
-
-def probe(node):
-    q = urllib.parse.quote(node, safe="")
-    u = urllib.parse.quote("http://cp.cloudflare.com/", safe="")
-    try:
-        d = get("/proxies/%s/delay?timeout=8000&url=%s" % (q, u), timeout=20)
-        dl = d.get("delay")
-        return dl if isinstance(dl, int) and dl > 0 else None
-    except Exception:
-        return None
-
-
-try:
-    node = get("/proxies/PROXY").get("now") or ""
-    if not node:
-        sys.exit(0)
-    last = None
-    for i in range(WANT):
-        if i:
-            time.sleep(GAP)
-        last = probe(node)
-        if last is None:
-            sys.exit(0)          # 任一次失败 -> 整体作废
-    print("%s %d" % (node, last))
-except Exception:
-    pass
-PY
-)"
+# 探测逻辑归 rotate.py 所有（--probe-node）。钩子早先是内嵌一份 python 副本，
+# 连探针 URL 都在那里硬编码了一遍 —— 同一套判据两份实现，迟早漂移，而漂移的
+# 方向恰好是「钩子这份还写着一个已经废弃的 URL」，表现为恢复永远判不健康、
+# 机器安静地一直直连。
+#
+# 探针端点集合与「任一成功即算健康」的判据都在 rotate.py 的
+# NODE_HEALTH_URLS —— 那不是宽容：误判隧道死会泄漏（本项目头号问题），
+# 误判隧道活只是让 opencode.ai 撞一次失败的代理，不泄漏且下一轮纠正。
+RESULT="$("$PY3" "$BASE/rotate.py" --probe-node \
+            --probes "$HEALTH_PROBES" --gap "$HEALTH_GAP" 2>/dev/null || true)"
 
 NODE_ALIVE="${RESULT%% *}"
 DELAY_MS="${RESULT##* }"
