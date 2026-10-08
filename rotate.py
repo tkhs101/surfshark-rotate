@@ -281,6 +281,50 @@ def reload_config():
     time.sleep(5)
 
 
+# 分流不变量：opencode.ai 必须走 AUTOFALL，ip.sb 必须走 PROXY。
+#
+# 为什么要查 **已加载** 的规则而不是读 config.yaml：config.yaml 是我们的意图，
+# mihomo 的 /rules 是它**实际**在跑的东西。两者不一致时，只有后者说明真相 ——
+# 而「不一致」正是最难发现的那种故障：没有探测失败、没有降级、status 全绿，
+# 而 opencode.ai 正在用本机 IP 出网。
+#
+# 这条检查是确定性的：不需要任何流量，配合每次热重载自然发生。
+# 连接侧的阳性检测（direct_leaks）作为补充，它还能看到 rules 检查看不见的一类
+# —— sniffer 失效导致域名没被还原、纯 IP 建连落进 MATCH,DIRECT。
+def check_routing_invariants():
+    """核对 mihomo 实际加载的规则是否符合分流不变量。
+
+    返回 (是否全部符合, 说明文字列表)。读不到 /rules 时视为「无法判定」并返回
+    False —— 无法判定不该被当成通过，那是把不确定当确定的典型错误。
+    """
+    problems = []
+    try:
+        rules = (api("/rules") or {}).get("rules") or []
+    except Exception as e:
+        return False, [f"读不到 /rules：{type(e).__name__}: {e}"]
+    if not rules:
+        return False, ["/rules 返回空规则表"]
+
+    def target_of(needle):
+        for r in rules:
+            if not isinstance(r, dict):
+                continue
+            if needle in str(r.get("payload") or ""):
+                return r.get("proxy")
+        return None
+
+    for host, want, tag in (("opencode.ai", AUTOFALL, "opencode.ai"),
+                            ("ip.sb", "PROXY", "出口 IP 探测")):
+        got = target_of(host)
+        if got is None:
+            problems.append(f"{host} 的分流规则在已加载的规则表里找不到"
+                            f"（tag={tag}）—— 它会落进 MATCH,DIRECT，直接泄漏")
+        elif got != want:
+            problems.append(f"{host} 已加载的规则指向 {got}，应为 {want}"
+                            f"（tag={tag}）")
+    return (not problems), problems
+
+
 # 需要盯的流量。opencode.ai 是唯一「泄漏即严重」的目标：它直连时，
 # 对端看到的就是这台 VPS 自己的 GCP 机房 IP。
 LEAK_HOST = "opencode.ai"
@@ -846,6 +890,29 @@ def rotate_once(dry_run=False):
                 switch(target)
         except Exception:
             pass
+
+    # 2b) 核对已加载的分流规则
+    #
+    # 放在热重载**之后**：重载才是可能让 mihomo 实际生效的规则发生变化的时刻。
+    # 此刻读 /rules 问的是「它现在到底在跑什么」，而磁盘上的 config.yaml 只是
+    # 我们的意图 —— 两者不一致时只有前者说明真相。
+    #
+    # 不符合就退出非零：这是确定性的配置错误，不是网络抖动。退出码非零会让
+    # ExecMainStatus 变红 —— 那是唯一一个「不需要用户做任何事就能看到」的信号。
+    ok, problems = check_routing_invariants()
+    if not ok:
+        for m in problems:
+            log(f"!! 分流规则异常：{m}")
+        log("!! 这会让 opencode.ai 走直连，把本机 IP 泄漏出去，且没有任何其它信号能看见。")
+        log("   权威来源是 mihomo 的 /rules，不是磁盘上的 config.yaml。请人工核对。")
+        update_state({"routing_bad_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                      "routing_bad_reason": "; ".join(problems)})
+        raise SystemExit(3)
+    if state.get("routing_bad_at"):
+        # 之前坏过、现在好了 —— 清掉标记，但记一条「曾异常过」的字样，
+        # 免得「曾经坏过」在状态里看起来像从未发生
+        update_state({"routing_bad_at": "", "routing_bad_reason": ""})
+        log("    分流规则已恢复正常（此前记录到异常）")
 
     # 3) 验证 IP
     if dry_run:

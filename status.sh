@@ -121,6 +121,36 @@ if [ "$TIMER_ST" != "active" ] && [ "$AF_NOW" != "DIRECT" ] && [ "$DEG_FLAG" != 
     echo
 fi
 
+# ------------------------------------------------------------
+#  分流规则异常（跨连接的，不会因为连接断开而消失）
+# ------------------------------------------------------------
+# 上面那条连接侧检测有个实测出来的软肋：连接是瞬态的，没有流量时查不到。
+# 这一条是确定性的 —— rotate.py 每次热重载后都会核对 mihomo **已加载**的规则，
+# 不符就退出码 3（ExecMainStatus 变红）并在这里留下记录。它不需要任何流量。
+ROUTE_BAD=""
+if [ -n "$PY3" ] && [ -f "$STATE" ]; then
+    ROUTE_BAD="$("$PY3" -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+if d.get("routing_bad_at"):
+    print(d.get("routing_bad_at") + " | " + (d.get("routing_bad_reason") or ""))' \
+        "$STATE" 2>/dev/null)"
+fi
+if [ -n "$ROUTE_BAD" ]; then
+    printf '\n\033[1;41m\033[97m  ⚠ 分流规则异常：opencode.ai 不走 AUTOFALL  \033[0m\n'
+    c_err  "  最近一次核对：$ROUTE_BAD"
+    c_err  "  mihomo 已加载的规则里 opencode.ai 不指向 AUTOFALL —— 它会走直连，"
+    c_err  "  把本机 IP 泄漏出去。降级逻辑此时完全正常，所以横幅不会亮。"
+    c_err  "  排查：sudo /opt/surfshark-rotate/mihomo -t -d /opt/surfshark-rotate \\"
+    c_err  "        -f /opt/surfshark-rotate/config.yaml"
+    c_err  "        再用 curl -H 'Authorization: Bearer <secret>' \\"
+    c_err  "             http://127.0.0.1:9097/rules 看实际生效的目标"
+    echo
+fi
+
 line "轮换定时器"
 # ------------------------------------------------------------
 systemctl --no-pager list-timers surfshark-rotate.timer 2>/dev/null | sed 's/^/  /'

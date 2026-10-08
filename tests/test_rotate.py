@@ -51,6 +51,7 @@ class FakeMihomo(BaseHTTPRequestHandler):
     requests = []
     dead_urls = set()
     connections = []
+    rules = []
 
     def _auth_ok(self):
         return self.headers.get("Authorization") == "Bearer testsecret"
@@ -69,6 +70,8 @@ class FakeMihomo(BaseHTTPRequestHandler):
             return self._send(401, {"message": "unauthorized"})
         if self.path == "/version":
             return self._send(200, {"version": "test"})
+        if self.path == "/rules":
+            return self._send(200, {"rules": type(self).rules})
         if self.path == "/connections":
             return self._send(200, {"connections": type(self).connections,
                                     "uploadTotal": 0, "downloadTotal": 0})
@@ -132,6 +135,11 @@ class RotateTestBase(unittest.TestCase):
         FakeMihomo.requests = []
         FakeMihomo.dead_urls = set()
         FakeMihomo.connections = []
+        FakeMihomo.rules = [
+            {"type": "DomainSuffix", "payload": "opencode.ai", "proxy": "AUTOFALL"},
+            {"type": "DomainSuffix", "payload": "ip.sb", "proxy": "PROXY"},
+            {"type": "Match", "payload": "", "proxy": "DIRECT"},
+        ]
 
         import rotate
         self.rotate = rotate
@@ -542,6 +550,58 @@ class TestLeakDetection(RotateTestBase):
         try:
             self.assertIsNone(self.rotate.direct_leaks(),
                               "读不到要返回 None，不能当成「没有泄漏」")
+        finally:
+            self.rotate.API = saved
+
+
+class TestRoutingInvariants(RotateTestBase):
+    """热重载后核对 mihomo **已加载**的规则。
+
+    config.yaml 是我们的意图，/rules 是它实际在跑的东西。两者不一致时只有后者
+    说明真相 —— 而这正是最难发现的一类泄漏：没有探测失败、没有降级、status 全绿。
+    """
+
+    def test_ok_when_rules_match(self):
+        self.seed()
+        ok, problems = self.rotate.check_routing_invariants()
+        self.assertTrue(ok, "正常配置不该报错：%s" % problems)
+
+    def test_detects_opencode_pointed_at_direct(self):
+        """本次评审要求抓的核心失效。"""
+        self.seed()
+        for r in FakeMihomo.rules:
+            if r["payload"] == "opencode.ai":
+                r["proxy"] = "DIRECT"
+        ok, problems = self.rotate.check_routing_invariants()
+        self.assertFalse(ok)
+        self.assertTrue(any("opencode.ai" in m for m in problems), problems)
+
+    def test_detects_missing_rule(self):
+        """规则被删掉 -> 落进 MATCH,DIRECT，同样是泄漏。"""
+        self.seed()
+        FakeMihomo.rules = [r for r in FakeMihomo.rules if r["payload"] != "opencode.ai"]
+        ok, problems = self.rotate.check_routing_invariants()
+        self.assertFalse(ok)
+        self.assertTrue(any("找不到" in m for m in problems), problems)
+
+    def test_detects_ip_sb_probe_misrouting(self):
+        """ip.sb 挂错会让出口 IP 探测走错通道，降级判据随之失真。"""
+        self.seed()
+        for r in FakeMihomo.rules:
+            if r["payload"] == "ip.sb":
+                r["proxy"] = "AUTOFALL"
+        ok, problems = self.rotate.check_routing_invariants()
+        self.assertFalse(ok, "ip.sb 挂在 AUTOFALL 上是已知的坏设计，必须能检出")
+
+    def test_unreadable_is_not_treated_as_ok(self):
+        """无法判定不等于通过 —— 把不确定当确定是典型的静默失败。"""
+        self.seed()
+        saved = self.rotate.API
+        self.rotate.API = "http://127.0.0.1:1"
+        try:
+            ok, problems = self.rotate.check_routing_invariants()
+            self.assertFalse(ok, "读不到 /rules 时不能返回通过")
+            self.assertTrue(problems)
         finally:
             self.rotate.API = saved
 
