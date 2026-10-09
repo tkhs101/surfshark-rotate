@@ -2232,5 +2232,46 @@ class TestRotLogCapFollowsWindow(unittest.TestCase):
                                 "上限至少要是窗口内轮次数的两倍，否则重复率会被截断")
 
 
+class TestIdxFollowsActualNode(unittest.TestCase):
+    """idx 必须对齐**实际落点**，不能只数轮换次数。
+
+    重摇会把这一轮带到计划外的节点上（实测：目标 SG，SG 抽到已用地址，
+    重摇后落在 JP）。若 idx 只 +1，下一轮推出的目标就可能恰好是上一轮
+    实际停留的节点 —— 日志里出现「当前节点=JP | 目标=JP」，
+    白转一次：换了 IP 但没换节点，四节点轮转退化成三节点。
+    """
+
+    def test_idx_is_recomputed_from_actual_node(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index('state["last_ip"] = new_ip')
+        blk = src[i:i + 700]
+        self.assertIn("NODES.index(target)", blk,
+                      "idx 必须按实际落点重算，而不是无条件 +1")
+        self.assertIn("int(state.get(\"idx\", 0)) + 1", blk,
+                      "target 不在 NODES 里时要退回原来的 +1 行为")
+
+    def test_next_pick_follows_the_landing_node(self):
+        """重摇落在 KR 之后，下一轮必须从 KR 之后继续。"""
+        import rotate as _r
+        st = {"idx": 0}
+        # 模拟：这一轮计划 0 号(SG)，重摇后落在 1 号(KR)
+        landed = _r.NODES[1]
+        st["idx"] = _r.NODES.index(landed) + 1
+        nxt = _r.pick_next(st)
+        self.assertNotEqual(nxt, landed,
+                            "重摇落在 %s 之后，下一轮的目标不能还是 %s"
+                            % (landed, landed))
+        self.assertEqual(nxt, _r.NODES[2])
+
+    def test_unchanged_when_no_redraw(self):
+        """没重摇时行为不变 —— 目标节点 +1。"""
+        import rotate as _r
+        st = {"idx": 2}
+        landed = _r.pick_next(st)
+        st["idx"] = _r.NODES.index(landed) + 1
+        self.assertEqual(_r.pick_next(st), _r.NODES[3],
+                         "无重摇时仍应是严格 +1 轮转")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

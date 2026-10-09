@@ -1327,7 +1327,14 @@ def rotate_once(dry_run=False):
     # 从不相同（48h/181 周期 0 次），所以它恒为 0、tier 恒为 0，
     # 整套分档是死代码。「重复」现在由 recent 窗口直接表达。
     state["last_ip"] = new_ip
-    state["idx"] = int(state.get("idx", 0)) + 1
+    # idx 必须对齐到**实际落点**，而不是「轮换次数」。
+    # 重摇会把这一轮带到计划外的节点上（实测：目标 SG，SG 抽到已用地址，
+    # 重摇后落在 JP），而 idx 只 +1 的话，下一轮推出的目标可能恰好就是
+    # 上一轮实际停留的那个节点 —— 日志里出现「当前节点=JP | 目标=JP」，
+    # 白转一次：换了 IP，但没换节点，四节点轮转因此退化成三节点。
+    # 所以这里按实际落点重算，使下一轮从它之后继续。
+    _now_at = NODES.index(target) if target in NODES else None
+    state["idx"] = (_now_at + 1) if _now_at is not None else (int(state.get("idx", 0)) + 1)
     if new_ip:
         state["recent"] = remember_ip(state, new_ip)
     # 显式授权物化：主记账点，全新安装首轮的轮换状态靠它落盘。
