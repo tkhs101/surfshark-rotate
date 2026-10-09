@@ -1496,7 +1496,7 @@ class TestRotationStrategy(unittest.TestCase):
         """12h 需要的不同地址数必须 <= 实测池并集，否则数学上不可能达标。"""
         need = 720 // self.r.ROUND_INTERVAL_MIN
         pools = {"JP 日本-东京": 47, "KR 韩国-首尔": 32,
-                 "SG 新加坡": 17, "TW 台湾-台北": 15}
+                 "SG 新加坡": 17, "TW 台湾-台北": 13}
         union = sum(pools[n] for n in self.r.NODES if n in pools)
         self.assertLessEqual(need, union,
                              "间隔 %d 分钟 -> 12h 需 %d 个不同地址，"
@@ -1506,7 +1506,7 @@ class TestRotationStrategy(unittest.TestCase):
     def test_five_minute_interval_is_now_infeasible(self):
         """5 分钟是这个配置的边界之外 —— 必须被显式承认。"""
         need = 720 // 5
-        union = 47 + 32 + 17 + 15
+        union = 47 + 32 + 17 + 13
         self.assertGreater(need, union,
                            "若这条不再成立（池子变大），可以重新评估间隔")
 
@@ -1535,7 +1535,7 @@ class TestIntervalMatchesBudget(unittest.TestCase):
     def test_five_minutes_is_rejected_by_the_budget(self):
         """5 分钟是边界之外。若哪天池子变大，这条会红，那是重新评估的信号。"""
         import rotate as _r
-        union = 47 + 32 + 17 + 15
+        union = 47 + 32 + 17 + 13
         self.assertGreater(720 // 5, union)
 
 
@@ -1737,6 +1737,72 @@ class TestSuiteItselfRuns(unittest.TestCase):
         declared = set(_r.findall(r"^class (Test\w+)", src, _r.M))
         self.assertEqual(declared - got, set(),
                          "这些类声明了但没被收集：%s" % sorted(declared - got))
+
+
+class TestReadmeMatchesReality(unittest.TestCase):
+    """README 里的间隔与时间尺度必须与代码一致。
+
+    我把间隔从 5 分钟改成 10 分钟时只改了 timer 与 ADR，README 里的 4 处
+    「每 5 分钟」原封不动 —— 而降级判据那行「约 10 分钟」也跟着错了
+    （2 轮 × 10 分钟 = 20 分钟）。这类陈述不会让任何测试变红。
+    """
+
+    def _readme(self):
+        return (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_no_stale_five_minute_claims(self):
+        self.assertNotIn("每 5 分钟", self._readme(),
+                         "间隔已改为 10 分钟，README 仍在说 5 分钟")
+        self.assertNotIn("每 5 分钟自动换", self._readme())
+
+    def test_declared_interval_matches_timer(self):
+        import rotate as _r
+        self.assertIn("每 %d 分钟" % _r.ROUND_INTERVAL_MIN, self._readme(),
+                      "README 应按代码里的 ROUND_INTERVAL_MIN 表述")
+
+    def test_degrade_window_math_matches(self):
+        """降级是「连续 N 轮」，换算成时间要乘间隔。"""
+        import rotate as _r
+        minutes = _r.DEGRADE_AFTER_FAILS * _r.ROUND_INTERVAL_MIN
+        self.assertIn("约 %d 分钟" % minutes, self._readme(),
+                      "降级需要 %d 轮 × %d 分钟 = %d 分钟，README 应这么写"
+                      % (_r.DEGRADE_AFTER_FAILS, _r.ROUND_INTERVAL_MIN, minutes))
+
+
+class TestRepeatRateIsHonest(unittest.TestCase):
+    """「12h 不重复」是承诺，但只有跑满 12 小时才算验证过。
+
+    用 recent 算重复率会把重复吃掉 —— recent 对同一 IP 只留最新一条，
+    所以它永远没有重复。需要一个**每轮都记**的 rot_log 才能算出来。
+    """
+
+    def test_rot_log_records_every_round_including_repeats(self):
+        import rotate as _r
+        st = {"rot_log": [], "recent": []}
+        now = 1700000000
+        for ip in ("1.1.1.1", "1.1.1.1", "2.2.2.2"):
+            st["rot_log"] = _r.prune_recent(st.get("rot_log"), now)
+            st["rot_log"].append((now, ip))
+        hist = [ip for _, ip in st["rot_log"]]
+        self.assertEqual(len(hist), 3, "rot_log 必须记下每一轮，重复也要记")
+        self.assertEqual(len(hist) - len(set(hist)), 1, "能算出 1 次重复")
+
+    def test_recent_alone_would_hide_the_repeat(self):
+        """这正是不能用 recent 算重复率的原因。"""
+        import rotate as _r
+        st = {"recent": []}
+        now = 1700000000
+        for ip in ("1.1.1.1", "1.1.1.1"):
+            st["recent"] = _r.remember_ip(st, ip, now=now)
+        self.assertEqual(len(_r.recent_ips(st, now=now)), 1,
+                         "recent 去重后看不出发生过两次")
+
+    def test_status_states_that_the_window_must_fill_first(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        self.assertIn("承诺要到 12 小时后才算数", blk,
+                      "窗口没跑满时不能让人以为已经达标")
 
 
 if __name__ == "__main__":

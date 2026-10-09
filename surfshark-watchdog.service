@@ -1,0 +1,29 @@
+[Unit]
+# 看门狗：不负责修复，只负责**在没人看的时候把话说出去**。
+#
+# [为什么需要它] 此前全部告警都是**拉式**的：泄漏、降级、分流异常都只显示在
+# status.sh 的输出里。于是发现率等于「有人恰好跑了一次 status.sh」的概率 ——
+# 而这个项目的头号问题恰恰是**静默泄漏**：系统全绿、探测正常、却在直连。
+# 一个只在你去看它时才说话的监控，对静默故障等于没有。
+#
+# [它做什么] 周期跑一次，把「需要注意」的状态写进一个**持久标记文件**，
+# 并置一个 systemd 标记单元（`systemctl list-units` 一眼能看见）。
+# 它**不做任何修复动作** —— 修复归 rotate.py 与钩子，这里只负责出声。
+#
+# [为什么用标记而不是直接发通知] 本项目刻意不引入外部依赖（没有 webhook、
+# 没有邮件、没有第三方告警服务）。标记文件是**可被任何外部采集器接走的**最小接口：
+# 你有 Telegram/邮件/短信通道，写个脚本读这个文件即可，不必改本项目。
+#
+# [误报方向的选择] 宁可多喊也不漏喊：本 watchdog **只报不修**，所以报错了
+# 最多是打扰；漏报了就是一次静默泄漏。与 ADR 的硬规则同向。
+Description=Surfshark 轮换看门狗（只出声，不修复）
+Documentation=file:///opt/surfshark-rotate/README.md
+After=surfshark-rotate.service
+
+[Service]
+Type=oneshot
+ExecStart=/opt/surfshark-rotate/watchdog.sh
+TimeoutStartSec=90
+
+[Install]
+WantedBy=multi-user.target

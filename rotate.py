@@ -1313,8 +1313,18 @@ def rotate_once(dry_run=False):
     if new_ip:
         state["recent"] = remember_ip(state, new_ip)
     # 显式授权物化：主记账点，全新安装首轮的轮换状态靠它落盘。
+    # rot_log：与 recent 同窗口的 [(ts, ip), ...]，**每一轮都记**，包括重复的。
+    # 它和 recent 的区别是：recent 只存「当前还持有」的地址（同一 IP 只留最新一条），
+    # 而 rot_log 记的是「发生过什么」。没有它就算不出重复率 ——
+    # 用 recent 的长度算会把重复吃掉（同一 IP 只留一条）。
+    rot_log = prune_recent(state.get("rot_log"))
+    if new_ip:
+        rot_log.append((time.time(), new_ip))
+        if len(rot_log) > 500:
+            rot_log = rot_log[-500:]
     update_state({"last_ip": new_ip, "idx": state["idx"],
-                  "recent": state.get("recent", [])},
+                  "recent": state.get("recent", []),
+                  "rot_log": rot_log},
                  require_existing=False)
     log(f"--- 完成 | 节点={target} | IP={new_ip} | "
         f"{RECENT_WINDOW_H}h 内已用 {len(state['recent'])} 个地址 ---")
@@ -1371,6 +1381,19 @@ def show_status():
             f"重摇不可能成功；需要加节点或放长间隔。")
     log(f"12h 预算 : 需 {need} 个不同地址 / 窗口内已用 {len(used)} / "
         f"间隔 {ROUND_INTERVAL_MIN} 分钟")
+    # 「窗口内已用」不是「已用过的总数」—— 它只统计还没过期的。
+    # 所以窗口刚建立或刚被清空时，这个数会显得很小，而**重复其实正在发生**。
+    # 诚实起见，把「承诺 vs 实测」并排打出来，让人一眼看出验证到哪一步了。
+    hist = [ip for _, ip in prune_recent(st.get("rot_log"))]
+    if hist:
+        n = len(hist)
+        rep = n - len(set(hist))
+        log(f"12h 验证 : 已记录 {n} 轮，重复 {rep} 次"
+            + ("（达标：0 重复）" if rep == 0 else f"（重复率 {100*rep//n}%）"))
+        log(f"           窗口内 {len(used)}/{need}，"
+            f"满窗前重复仍可能发生 —— 承诺要到 12 小时后才算数")
+    else:
+        log("12h 验证 : 尚无足够样本（每轮记录一次出口 IP，攒够一轮才算数）")
     log(f"该节点连接 : {conns_on(node)}")
     # 未降级却出现 opencode.ai 走 DIRECT = 正在泄漏，且没有任何其它信号能看见
     leaks = direct_leaks()

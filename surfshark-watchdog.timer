@@ -1,0 +1,11 @@
+[Unit]
+Description=Surfshark 看门狗周期（只出声，不修复）
+
+[Timer]
+OnBootSec=5min
+# 比轮换（10 分钟）更密：它要能在**两轮之间**发现「轮换根本没跑」这种情况
+OnUnitActiveSec=5min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

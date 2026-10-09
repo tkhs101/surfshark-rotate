@@ -1,6 +1,6 @@
 # Surfshark 出口 IP 轮换 —— VPS 版
 
-在一台 Linux VPS 上，用 mihomo + Surfshark WireGuard 隧道做**整机分流**，并**每 5 分钟自动换一个出口 IP**。
+在一台 Linux VPS 上，用 mihomo + Surfshark WireGuard 隧道做**整机分流**，并**每 10 分钟自动换一个出口 IP**。
 无 GUI、systemd 托管、开机自启，适合长期挂机跑。
 
 默认分流规则（改 `config.yaml` 即可调整）：
@@ -8,7 +8,7 @@
 ```
 整机流量
    ├─ opencode.ai / ip.sb ──→ TUN ──→ PROXY 组 ──→ WireGuard ──→ Surfshark 节点
-   │                                                    （每 5 分钟换一次出口 IP）
+   │                                                    （每 10 分钟换一次出口 IP）
    └─ 其他所有（含 SSH）───→ DIRECT ─────────────────→ 物理网卡
 ```
 
@@ -25,7 +25,7 @@
 VPS 整机流量
    │
    ├─ opencode.ai ──→ TUN ──→ AUTOFALL ──┬─（rotate.py 判定正常）→ PROXY 组 → WireGuard → Surfshark JP/KR
-   │                                      │                              （每 5 分钟换一次出口 IP）
+   │                                      │                              （每 10 分钟换一次出口 IP）
    │                                      └─（连续 2 轮探测失败）→ DIRECT ────→ 物理网卡
    ├─ ip.sb ──→ TUN ──→ PROXY ────────────┴─→ WireGuard    （测量通道，故意不进降级链）
    └─ 其他所有（含 SSH）───→ DIRECT ─────────────────────────────→ 物理网卡
@@ -36,7 +36,7 @@ VPS 整机流量
 | 单元 | 作用 |
 |---|---|
 | `mihomo.service` | 内核常驻，`Restart=always` |
-| `surfshark-rotate.timer` | **那个 24 小时循环**，每 5 分钟触发一次 `surfshark-rotate.service` |
+| `surfshark-rotate.timer` | **那个 24 小时循环**，每 10 分钟触发一次 `surfshark-rotate.service` |
 | （降级时会临时起一个一次性单元） | 节点恢复后的复查，见[降级与恢复](#降级与恢复) |
 
 **AUTOFALL 是降级链**：节点不可用时 `opencode.ai` 会退到直连（还能用，只是出口变回本机），
@@ -166,7 +166,7 @@ opencode.ai 会直接连不上，日志里只有一行 `dial PROXY ... context d
 
 `select` 组没有健康检查，**永不自行翻转**。降级需要**两个独立信号同时成立**：
 
-1. 连续 2 轮取不到出口 `IP`（约 10 分钟）—— 要求故障持续至少一个完整轮换周期
+1. 连续 2 轮取不到出口 `IP`（间隔 10 分钟，约 20 分钟）—— 要求故障持续至少一个完整轮换周期
 2. 控制面 `/proxies/<节点>/delay` 也探测不到节点
 
 第 2 条不可省。只看第 1 条会把「ip.sb 限流或宕机」误判成「隧道坏了」，
