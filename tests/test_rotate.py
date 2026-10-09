@@ -1676,3 +1676,68 @@ class TestStatusHasNoFalseAlarm(unittest.TestCase):
         self.assertIn("len(spare) <= 0", code,
                       "该出声的场合是「池子抽干」，不是「刚用过这个」")
 
+
+
+class TestSuiteItselfRuns(unittest.TestCase):
+    """这个文件必须真的会跑。
+
+    我在删重复测试类时把文件末尾的 `if __name__ == "__main__": unittest.main()`
+    一起删掉了。于是 `python3 tests/test_rotate.py` 变成 **exit=0、零输出**，
+    而我照惯例检查「exit=0、grep FAILED 计数为 0」—— **绿灯来自一个根本没运行的套件**，
+    并且我把这个假绿灯写进了提交信息。
+
+    早先的 `TestRunnerOrder` 只检查「runner 之后不应有类」，
+    查不出「runner 根本不存在」。这一条查那个。
+    """
+
+    def test_main_block_exists(self):
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        self.assertIn('if __name__ == "__main__":', src,
+                      "没有 __main__ 块 -> 直接运行本文件一个测试都不会跑，"
+                      "而 exit 仍是 0")
+        self.assertIn("unittest.main(", src)
+
+    def test_runner_is_actually_wired_up(self):
+        """用一个**不存在**的用例名运行：快，且能证明 runner 真的接好了。
+
+        早先那版是「直接运行本文件」，结果它会把整个套件再跑一遍 ——
+        套件套自己，300 秒都跑不完。这版只验证接线，不执行任何用例。
+        """
+        import subprocess
+        r = subprocess.run(
+            [sys.executable, str(ROOT / "tests/test_rotate.py"),
+             "TestSuiteItselfRuns.test_definitely_not_a_real_test"],
+            capture_output=True, text=True, timeout=120)
+        out = (r.stdout or "") + (r.stderr or "")
+        import re as _r
+        m = _r.search(r"Ran (\d+) test", out)
+        self.assertIsNotNone(m,
+                             "runner 没接上 —— 直接运行本文件没有任何用例计数"
+                             "（exit=%s，输出 %d 字节）"
+                             % (r.returncode, len(out)))
+        self.assertLessEqual(int(m.group(1)), 5,
+                             "探针不该真的跑整个套件（跑了 %s 个）" % m.group(1))
+
+    def test_declared_classes_match_collected(self):
+        """声明的类数必须与 loader 收集到的类数一致。"""
+        import unittest as _u
+        suite = _u.TestLoader().discover(str(ROOT / "tests"),
+                                          pattern="test_rotate.py")
+        got = set()
+
+        def walk(s):
+            for t in s:
+                if isinstance(t, _u.TestSuite):
+                    walk(t)
+                else:
+                    got.add(type(t).__name__)
+        walk(suite)
+        src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
+        import re as _r
+        declared = set(_r.findall(r"^class (Test\w+)", src, _r.M))
+        self.assertEqual(declared - got, set(),
+                         "这些类声明了但没被收集：%s" % sorted(declared - got))
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
