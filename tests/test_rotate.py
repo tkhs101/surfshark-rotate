@@ -186,7 +186,7 @@ class RotateTestBase(unittest.TestCase):
                           .read_text(encoding="utf-8"))
 
     def seed(self, **kw):
-        d = {"tier": 0, "idx": 5, "last_ip": "1.2.3.4", "fail_streak": 0}
+        d = {"idx": 5, "node_at": 1, "last_ip": "1.2.3.4", "fail_streak": 0}
         d.update(kw)
         pathlib.Path(self.rotate.STATE_FILE).write_text(json.dumps(d))
         return d
@@ -232,10 +232,10 @@ class TestApiContract(RotateTestBase):
 class TestStatePrimitives(RotateTestBase):
 
     def test_patch_only_touches_named_keys(self):
-        self.seed(last_ip="5.6.7.8", tier=2, idx=41)
+        self.seed(last_ip="5.6.7.8", node_at=2, idx=41)
         self.rotate.update_state({"recovery_streak": 1})
         s = self.state()
-        self.assertEqual(s["tier"], 2)
+        self.assertEqual(s["node_at"], 2)
         self.assertEqual(s["idx"], 41)
         self.assertEqual(s["last_ip"], "5.6.7.8")
         self.assertEqual(s["recovery_streak"], 1)
@@ -257,20 +257,20 @@ class TestStatePrimitives(RotateTestBase):
         self.assertEqual(self.state()["recheck_tries"], 2)
 
     def test_corrupt_state_is_reported_not_swallowed(self):
-        pathlib.Path(self.rotate.STATE_FILE).write_text('{"tier": 3, "last')
+        pathlib.Path(self.rotate.STATE_FILE).write_text('{"node_at": 3, "last')
         buf = io.StringIO()
         old, sys.stdout = sys.stdout, buf
         try:
             s = self.rotate.load_state()
         finally:
             sys.stdout = old
-        self.assertEqual(s["tier"], 0)          # 仍要能用
+        self.assertEqual(s["node_at"], 0)      # 仍要能用
         out = buf.getvalue()
         self.assertIn("状态文件损坏", out, "损坏必须出声，不能被静默当成「没有状态」")
 
     def test_missing_state_is_normal(self):
         self.assertFalse(pathlib.Path(self.rotate.STATE_FILE).exists())
-        self.assertEqual(self.rotate.load_state()["tier"], 0)
+        self.assertEqual(self.rotate.load_state()["node_at"], 0)
 
     def test_clear_degraded_flags_is_idempotent(self):
         self.seed(degraded=True, recheck_tries=3)
@@ -1462,17 +1462,20 @@ class TestRotationStrategy(unittest.TestCase):
                             "%s 不在 NODES 里" % n)
 
     def test_pick_next_cycles_through_all_nodes(self):
-        st = {"idx": 0}
+        # node_at 才是选点依据（idx 只数轮次）—— 见 TestIdxAndNodeAtAreSeparate
+        st = {"idx": 0, "node_at": 0}
         seen = []
         for _ in range(len(self.r.NODES) * 2):
-            seen.append(self.r.pick_next(st))
+            n = self.r.pick_next(st)
+            seen.append(n)
             st["idx"] += 1
+            st["node_at"] = (self.r.NODES.index(n) + 1) % len(self.r.NODES)
         self.assertEqual(len(set(seen[:4])), 4, "一个完整周期必须经过四个节点")
         self.assertEqual(seen[:4], seen[4:], "第二个周期应完全重复")
 
     def test_skip_moves_to_a_different_pool(self):
         """重摇**必须换节点** —— 原地重摇实测接受率 0/9。"""
-        st = {"idx": 0}
+        st = {"idx": 0, "node_at": 0}
         base = self.r.pick_next(st)
         self.assertNotEqual(self.r.pick_next(st, skip=1), base,
                             "skip 不换节点 = 原地重摇，实测永远抽到用过的地址")
@@ -2198,12 +2201,25 @@ class TestStatusNumbersAreExplained(unittest.TestCase):
         r = (ROOT / "rotate.py").read_text(encoding="utf-8")
         i = r.index("def show_status")
         blk = r[i:r.index(chr(10) + "def main(", i)]
-        for label in ("轮换产出", "12h 预算", "12h 验证"):
+        for label in ("轮换产出", "12h 验证"):
             self.assertIn(label, blk, "缺少 %s 这一行" % label)
-        # 三个数必须互相说明
-        self.assertIn("idx", blk, "轮换轮数应来自 idx")
-        self.assertIn("rot_log", blk, "重复率应来自 rot_log（recent 会去重，算不出重复）")
-        self.assertIn("recent", blk, "预算应来自 recent")
+        # 三个数各自的数据来源必须都在，且各自带一句「量的是什么」
+        self.assertIn('st.get("idx"', blk, "轮次数应来自 idx")
+        self.assertIn("rot_log", blk,
+                      "重复率应来自 rot_log（recent 去重，算不出重复）")
+        self.assertIn("recent_ips(", blk, "地址数应来自 recent")
+        for phrase in ("自安装起累计", "自 rot_log 引入起"):
+            self.assertIn(phrase, blk,
+                          "每个数必须说明它量的是什么，否则读者无法判断"
+                          "三个数不等是否矛盾")
+
+    def test_no_bare_number_lines_without_explanation(self):
+        """实机输出曾出现三个不等且无说明的数字 —— 那正是本测试要防的。"""
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("def show_status")
+        blk = r[i:r.index(chr(10) + "def main(", i)]
+        self.assertNotIn("12h 预算 :", blk,
+                         "预算行已并入轮换产出的说明；单独一行只会多一个无解释的数字")
 
 
 class TestRotLogCapFollowsWindow(unittest.TestCase):
@@ -2253,10 +2269,9 @@ class TestIdxFollowsActualNode(unittest.TestCase):
     def test_next_pick_follows_the_landing_node(self):
         """重摇落在 KR 之后，下一轮必须从 KR 之后继续。"""
         import rotate as _r
-        st = {"idx": 0}
-        # 模拟：这一轮计划 0 号(SG)，重摇后落在 1 号(KR)
+        st = {"idx": 0, "node_at": 0}
         landed = _r.NODES[1]
-        st["idx"] = _r.NODES.index(landed) + 1
+        st["node_at"] = _r.NODES.index(landed) + 1
         nxt = _r.pick_next(st)
         self.assertNotEqual(nxt, landed,
                             "重摇落在 %s 之后，下一轮的目标不能还是 %s"
@@ -2266,11 +2281,73 @@ class TestIdxFollowsActualNode(unittest.TestCase):
     def test_unchanged_when_no_redraw(self):
         """没重摇时行为不变 —— 目标节点 +1。"""
         import rotate as _r
-        st = {"idx": 2}
+        st = {"idx": 2, "node_at": 2}
         landed = _r.pick_next(st)
-        st["idx"] = _r.NODES.index(landed) + 1
+        st["node_at"] = _r.NODES.index(landed) + 1
         self.assertEqual(_r.pick_next(st), _r.NODES[3],
                          "无重摇时仍应是严格 +1 轮转")
+
+
+class TestIdxAndNodeAtAreSeparate(unittest.TestCase):
+    """`idx`（累计轮次）与 `node_at`（节点位置）必须互不干扰。
+
+    上一轮我把 `idx` 改成「对齐实际落点」以修重摇打乱序列 ——
+    而 `idx` 当时同时承担两件事：给 --status 显示「已换过 N 轮」，
+    以及给 `pick_next` 当轮询位置。结果两个消费者都被毁了：
+    实机输出「已换过 3 轮（自安装起累计）」，而实际轮换了 30+ 轮。
+
+    这条测试盯的是**语义不串**，而���是某一行写法。
+    """
+
+    def test_idx_counts_rotations(self):
+        import rotate as _r
+        st = {"idx": 0, "node_at": 0}
+        for _ in range(7):
+            n = _r.pick_next(st)
+            st["idx"] = st["idx"] + 1
+            st["node_at"] = (_r.NODES.index(n) + 1) % len(_r.NODES)
+        self.assertEqual(st["idx"], 7, "idx 必须只数轮次，不受落点影响")
+        self.assertEqual(st["node_at"], 3, "node_at 才是位置")
+
+    def test_round_robin_is_strict(self):
+        import rotate as _r
+        st = {"idx": 0, "node_at": 0}
+        seq = []
+        for _ in range(8):
+            n = _r.pick_next(st)
+            seq.append(n)
+            st["idx"] += 1
+            st["node_at"] = (_r.NODES.index(n) + 1) % len(_r.NODES)
+        self.assertEqual(seq[:4], seq[4:], "四个节点必须严格循环")
+        self.assertEqual(len(set(seq[:4])), 4)
+
+    def test_redraw_does_not_corrupt_idx(self):
+        """重摇把落点带偏时，idx 仍必须只加一。"""
+        import rotate as _r
+        st = {"idx": 5, "node_at": 0}
+        landed = _r.NODES[1]                       # 重摇落到 KR
+        st["idx"] += 1
+        st["node_at"] = (_r.NODES.index(landed) + 1) % len(_r.NODES)
+        self.assertEqual(st["idx"], 6, "重摇不应让 idx 跳变")
+        self.assertEqual(_r.pick_next(st), _r.NODES[2],
+                         "下一轮必须从落点之后继续，不能又落在同一个节点")
+
+    def test_pick_next_does_not_read_idx(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def pick_next")
+        blk = src[i:src.index(chr(10) + "def ", i + 10)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn('state.get("idx"', code,
+                         "pick_next 读 idx 会让「轮次数」再次影响「选哪个节点」")
+        self.assertIn("node_at", code)
+
+    def test_status_counts_from_idx_not_node_at(self):
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("def show_status")
+        blk = r[i:r.index(chr(10) + "def main(", i)]
+        self.assertIn('int(st.get("idx", 0))', blk,
+                      "「已换过 N 轮」必须来自 idx")
 
 
 if __name__ == "__main__":

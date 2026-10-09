@@ -804,12 +804,12 @@ def load_state():
         with open(STATE_FILE, encoding="utf-8") as f:
             return json.load(f)
     except FileNotFoundError:
-        return {"tier": 0, "idx": 0, "last_ip": None}
+        return {"idx": 0, "node_at": 0, "last_ip": None}
     except Exception as e:
         log(f"!! 状态文件损坏（{type(e).__name__}: {e}）—— 按「没有状态」处理")
         log("   如果此刻明明是降级态，轮换不会再自动恢复，请手工确认：")
         log("   sudo python3 %s --status" % os.path.join(BASE, "rotate.py"))
-        return {"tier": 0, "idx": 0, "last_ip": None}
+        return {"idx": 0, "node_at": 0, "last_ip": None}
 
 
 def update_state(patch=None, remove=(), incr=None, require_existing=True):
@@ -1012,9 +1012,18 @@ def reset_recheck_tries():
 
 
 def pick_next(state, skip=0):
-    """扁平轮询下一个节点；skip 用于「重摇时换一个池子抽」。"""
-    idx = int(state.get("idx", 0))
-    return NODES[(idx + skip) % len(NODES)]
+    """扁平轮询下一个节点；skip 用于「重摇时换一个池子抽」。
+
+    【用 node_at 而不是 idx】早先这里读 `idx`，而 idx 同时承担两件事：
+    「累计轮换次数」（给 --status 显示）与「下一个节点的位置」（给轮询）。
+    上一轮把 idx 改成「对齐实际落点」以修重摇打乱序列，于是它变成了节点位置，
+    **两个消费者都被毁了** —— 「已换过 N 轮」显示成节点下标。
+    现在拆开：idx 只数轮次，node_at 只记位置。
+    """
+    # **不回退到 idx**：那会把两个语义重新缝在一起，而且旧状态文件里
+    # idx 存的是累计轮次（比如 33），拿它当位置会跳到 NODES[33 % 4]。
+    at = int(state.get("node_at", 0) or 0)
+    return NODES[(at + skip) % len(NODES)]
 
 
 def switch_and_reload(node):
@@ -1333,8 +1342,9 @@ def rotate_once(dry_run=False):
     # 上一轮实际停留的那个节点 —— 日志里出现「当前节点=JP | 目标=JP」，
     # 白转一次：换了 IP，但没换节点，四节点轮转因此退化成三节点。
     # 所以这里按实际落点重算，使下一轮从它之后继续。
-    _now_at = NODES.index(target) if target in NODES else None
-    state["idx"] = (_now_at + 1) if _now_at is not None else (int(state.get("idx", 0)) + 1)
+    state["idx"] = int(state.get("idx", 0)) + 1
+    state["node_at"] = ((NODES.index(target) + 1) % len(NODES)
+                        if target in NODES else 0)
     if new_ip:
         state["recent"] = remember_ip(state, new_ip)
     # 显式授权物化：主记账点，全新安装首轮的轮换状态靠它落盘。
@@ -1355,6 +1365,7 @@ def rotate_once(dry_run=False):
         if len(rot_log) > cap:
             rot_log = rot_log[-cap:]
     update_state({"last_ip": new_ip, "idx": state["idx"],
+                  "node_at": state["node_at"],
                   "recent": state.get("recent", []),
                   "rot_log": rot_log,
                   "last_redraw_failed": exhausted},
@@ -1425,14 +1436,17 @@ def show_status():
     # 与上一轮修掉的 same_ip_streak 假告警是同一个毛病，只换了张脸。
     # 有意义的问题是「**除了刚用过的这个**，还剩多少可用」。
     spare = used - {ip, st.get("last_ip")}
-    log(f"轮换产出 : 已换过 {int(st.get('idx', 0))} 轮；"
-        f"窗口内已用 {len(used)} 个地址，"
-        f"当前 {ip or '(未知)'} 之外还有 {len(spare)} 个没用过")
+    # 三个数（轮次数 / 窗口内地址数 / 已记录轮数）来自三个不同的字段，
+    # 早先并排打出来却没有任何说明 —— 实测「已换过 33 轮 / 窗口内 23 个 /
+    # 已记录 25 轮」，读者无法判断这是矛盾还是各有定义。
+    # 现在每个数都带上它量的是什么，以及彼此为什么不等。
+    rounds = int(st.get("idx", 0))
+    log(f"轮换产出 : 已换过 {rounds} 轮（自安装起累计）")
+    log(f"           12h 窗口内用掉 {len(used)} 个不同地址"
+        f"（轮换次数 > 地址数，是因为用掉的会过期退出窗口）")
     if len(spare) <= 0:
         log("⚠ 已经没有任何未用过的地址 —— 池子抽干了。"
             f"重摇不可能成功；需要加节点或放长间隔。")
-    log(f"12h 预算 : 需 {need} 个不同地址 / 窗口内已用 {len(used)} / "
-        f"间隔 {ROUND_INTERVAL_MIN} 分钟")
     # 「窗口内已用」不是「已用过的总数」—— 它只统计还没过期的。
     # 所以窗口刚建立或刚被清空时，这个数会显得很小，而**重复其实正在发生**。
     # 诚实起见，把「承诺 vs 实测」并排打出来，让人一眼看出验证到哪一步了。
@@ -1440,12 +1454,14 @@ def show_status():
     if hist:
         n = len(hist)
         rep = n - len(set(hist))
-        log(f"12h 验证 : 已记录 {n} 轮，重复 {rep} 次"
+        log(f"12h 验证 : 记到 {n} 轮（自 rot_log 引入起），重复 {rep} 次"
             + ("（达标：0 重复）" if rep == 0 else f"（重复率 {100*rep//n}%）"))
-        log(f"           窗口内 {len(used)}/{need}，"
-            f"满窗前重复仍可能发生 —— 承诺要到 12 小时后才算数")
+        if n < need:
+            log(f"           只跑了 {n}/{need} 轮 —— 满窗前重复仍可能发生，"
+                f"承诺要到 12 小时后才算数")
     else:
-        log("12h 验证 : 尚无足够样本（每轮记录一次出口 IP，攒够一轮才算数）")
+        log("12h 验证 : 尚无样本（rot_log 是后加的，它之前的历史无法追溯，"
+            "所以这个数会比「已换过 N 轮」小）")
     log(f"该节点连接 : {conns_on(node)}")
     # 未降级却出现 opencode.ai 走 DIRECT = 正在泄漏，且没有任何其它信号能看见
     leaks = direct_leaks()
