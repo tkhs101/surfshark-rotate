@@ -2612,5 +2612,58 @@ class TestReport429Hook(unittest.TestCase):
 
 
 
+class TestBlacklistExpiresPerEntry(unittest.TestCase):
+    """黑名单**逐条**过期，不是每 12 小时整体清空一次。
+
+    这个区别很实际：整体清空意味着「一条 1 小时前拉的脏 IP，
+    会因为另一条 13 小时前的条目到期而被提前放出来」——
+    而它正是刚被上游确认过的那个。
+
+    早先的测试只有**单条**过期，于是它无法区分这两种语义：
+    单条场景下两者行为完全一样。这条测试用一个跨 12h 的混合表来判别。
+    """
+
+    def _mixed(self):
+        import rotate as _r, time
+        sec = 3600
+        now = time.time()
+        return [[now - 13 * sec, "OLD_13h"],
+                [now - 11 * sec, "MID_11h"],
+                [now - 1 * sec, "NEW_1h"]]
+
+    def test_only_expired_entries_are_dropped(self):
+        import rotate as _r
+        kept = [e[1] for e in _r.prune_blacklist(self._mixed())]
+        self.assertEqual(kept, ["MID_11h", "NEW_1h"],
+                         "只应清掉 13h 那条；11h 与 1h 的必须留着")
+
+    def test_not_a_bulk_clear(self):
+        """只要表里有一条没过期的，整表就不能被清空。"""
+        import rotate as _r
+        kept = _r.prune_blacklist(self._mixed())
+        self.assertTrue(kept,
+                        "实现成了「到点整体清空」—— 一条 1h 前拉的脏 IP "
+                        "会因为另一条 13h 前的条目到期而被提前放出来")
+
+    def test_fresh_entry_survives_an_expired_one(self):
+        import rotate as _r
+        import time
+        sec = 3600
+        now = time.time()
+        kept = [e[1] for e in _r.prune_blacklist(
+            [[now - 100 * sec, "VERY_OLD"], [now - 1 * sec, "BRAND_NEW"]])]
+        self.assertEqual(kept, ["BRAND_NEW"],
+                         "极老条目到期不得牵连刚加入的条目")
+
+    def test_all_expired_empties_the_list(self):
+        import rotate as _r, time
+        sec = 3600
+        now = time.time()
+        self.assertEqual(
+            _r.prune_blacklist([[now - 50 * sec, "A"], [now - 60 * sec, "B"]]),
+            [], "全部过期时才清空")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
