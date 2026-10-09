@@ -1281,6 +1281,9 @@ def rotate_once(dry_run=False):
     # 在同一个节点上原地重摇，抽中的必然是用过的。**换一个池子抽**才解决。
     seen = recent_ips(state)
     redraws = 0
+    # 显式初始化而不是 locals().get(...)：后者在某条分支给 exhausted
+    # 赋过值、而这里没重置时会粘住上一轮的值。评审提的次要项，成本是零。
+    exhausted = ""
     # 【重摇必须每次换一个**没试过**的节点，而不是靠 skip 往后挪】
     # 早先是 `pick_next(state, skip=redraws)`。skip 是对 len(NODES) 取模的，
     # 而 MAX_REDRAW(8) > len(NODES)(4) —— 于是第 5 次重摇起就绕回已经试过的
@@ -1335,12 +1338,19 @@ def rotate_once(dry_run=False):
     rot_log = prune_recent(state.get("rot_log"))
     if new_ip:
         rot_log.append((time.time(), new_ip))
-        if len(rot_log) > 500:
-            rot_log = rot_log[-500:]
+        # 上限必须与窗口**一致**，不能各裁各的。
+        # 早先这里是固定 500 条，而 recent 按 12h 窗口裁 —— 两者只有在
+        # 「500 > 12h 内的轮次数」时碰巧一致（当前 72 条）。
+        # 一旦间隔调短或窗口调长，rot_log 会先撞上限而 recent 不会，
+        # 于是「12h 验证」算出的重复率被静默截断 —— 而它正是用来
+        # 验证「12h 不重复」这条承诺的那个数。
+        cap = 720 // max(1, ROUND_INTERVAL_MIN) * 2
+        if len(rot_log) > cap:
+            rot_log = rot_log[-cap:]
     update_state({"last_ip": new_ip, "idx": state["idx"],
                   "recent": state.get("recent", []),
                   "rot_log": rot_log,
-                  "last_redraw_failed": locals().get("exhausted", "")},
+                  "last_redraw_failed": exhausted},
                  require_existing=False)
     log(f"--- 完成 | 节点={target} | IP={new_ip} | "
         f"{RECENT_WINDOW_H}h 内已用 {len(state['recent'])} 个地址 ---")

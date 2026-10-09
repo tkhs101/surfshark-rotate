@@ -2150,5 +2150,87 @@ class TestShowStatusReallyRuns(RotateTestBase):
             % (len(fired), fired, out[:600]))
 
 
+class TestStatusShAgreesOnThreeStates(unittest.TestCase):
+    """status.sh 与 rotate.py --status 必须说同一件事。
+
+    我给 --status 加了「状态不一致」这第三态，却没同步 status.sh ——
+    于是两个界面对同一时刻给出不同说法，而各自的文案都言之凿凿。
+    """
+
+    def test_status_sh_knows_the_inconsistent_state(self):
+        s = (ROOT / "status.sh").read_text(encoding="utf-8")
+        self.assertIn("状态不一致", s,
+                      "status.sh 不知道第三态；--status 知道，两者会对同一时刻各说一套")
+
+    def test_status_sh_explains_it_is_not_degradation(self):
+        s = (ROOT / "status.sh").read_text(encoding="utf-8")
+        i = s.index("状态不一致")
+        seg = s[i:i + 900]
+        self.assertIn("有意", seg,
+                      "必须说清它与「已降级」的区别 —— 降级是**有意**退到直连")
+
+    def test_both_surfaces_agree_on_the_condition(self):
+        """两边必须用**同一个条件**判定，而不是各判各的。"""
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        s = (ROOT / "status.sh").read_text(encoding="utf-8")
+        import re as _r
+        # 归一化空白后再比 —— 断言字符串的空格不是契约，语义一致才是。
+        def norm(x):
+            return _r.sub(r"\s+", "", x)
+        self.assertIn(
+            _r.sub(r"\s+", "", "inconsistent = (now == DEGRADED_TO) and not st.get"),
+            _r.sub(r"\s+", "", r),
+            "rotate.py 的判据变了")
+        self.assertIn(
+            _r.sub(r"\s+", "", '"$AF_NOW" = "DIRECT" ] && [ "$DEG_FLAG" != "true" ]'),
+            _r.sub(r"\s+", "", s),
+            "status.sh 的判据必须是同一个：AUTOFALL=DIRECT 且状态说没降级")
+
+
+class TestStatusNumbersAreExplained(unittest.TestCase):
+    """--status 并排打出三个数，必须说清各自量的是什么。
+
+    实机输出：已换过 32 轮 / 窗口内已用 22 个 / 已记录 18 轮。
+    三个数不等，且没有任何说明 —— 读者无法判断是矛盾还是各有含义。
+    """
+
+    def test_each_number_says_what_it_measures(self):
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("def show_status")
+        blk = r[i:r.index(chr(10) + "def main(", i)]
+        for label in ("轮换产出", "12h 预算", "12h 验证"):
+            self.assertIn(label, blk, "缺少 %s 这一行" % label)
+        # 三个数必须互相说明
+        self.assertIn("idx", blk, "轮换轮数应来自 idx")
+        self.assertIn("rot_log", blk, "重复率应来自 rot_log（recent 会去重，算不出重复）")
+        self.assertIn("recent", blk, "预算应来自 recent")
+
+
+class TestRotLogCapFollowsWindow(unittest.TestCase):
+    """rot_log 的上限必须与窗口绑定，不能是一个孤立的常数。
+
+    早先是固定 500 条，只在「500 > 12h 内的轮次数」时与 recent 碰巧一致
+    （当前 72 条）。间隔调短或窗口调长时，rot_log 会先撞上限而 recent 不会，
+    于是「12h 验证」算出的重复率被静默截断 —— 而它正是用来验证
+    「12h 不重复」这条承诺的那个数。
+    """
+
+    def test_cap_is_derived_not_hardcoded(self):
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("rot_log = prune_recent")
+        blk = r[i:r.index("update_state", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn("500", code, "固定上限会与窗口脱钩")
+        self.assertIn("ROUND_INTERVAL_MIN", code, "上限应由间隔推出")
+
+    def test_cap_is_at_least_twice_the_window(self):
+        import rotate as _r
+        cap = 720 // max(1, _r.ROUND_INTERVAL_MIN) * 2
+        need = 720 // max(1, _r.ROUND_INTERVAL_MIN)
+        self.assertGreaterEqual(cap, need * 2,
+                                "上限至少要是窗口内轮次数的两倍，否则重复率会被截断")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

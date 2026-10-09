@@ -113,6 +113,18 @@ try:
 except Exception:
     print("")' "$STATE" 2>/dev/null)"
 fi
+# 【第三种状态：AUTOFALL=DIRECT 但状态文件说没降级】
+# rotate.py --status 已经把它单列为「状态不一致」，这里必须跟上 ——
+# 否则两个界面对同一时刻给出不同说法，而各自的文案都言之凿凿。
+# 这个组合多半意味着状态文件丢了/损坏，而那正是钩子闸门会判
+# 「明确未降级」直接返回、自修路径永久失效的场景。
+if [ "$AF_NOW" = "DIRECT" ] && [ "$DEG_FLAG" != "true" ]; then
+    printf '\n\033[1;41m\033[97m  ⚠ 状态不一致：opencode.ai 在走直连，但状态文件说「没有降级」\033[0m\n'
+    printf '  \033[33m这不是「已降级」—— 降级是**有意**退到直连，而这里没人负责退、也没人负责回。\033[0m\n'
+    printf '  最可能：%s 丢失或损坏。钩子闸门会据此判「明确未降级」直接返回，\n' "$STATE"
+    printf '  于是永远没人把 AUTOFALL 切回 PROXY —— 而 opencode.ai 正在用本机 IP 出网。\033[0m\n'
+    printf '  处置：确认状态文件是否还在；坏了就删掉它并手工 sudo systemctl start surfshark-rotate.timer\n'
+fi
 if [ "$TIMER_ST" != "active" ] && [ "$AF_NOW" != "DIRECT" ] && [ "$DEG_FLAG" != "true" ]; then
     printf '\n\033[1;41m\033[97m  ⚠ 轮换已停摆且不处于降级态  \033[0m\n'
     c_err  "  定时器状态是「$TIMER_ST」，但降级标记为「否」—— 按设计，停表只会因为降级而发生。"
