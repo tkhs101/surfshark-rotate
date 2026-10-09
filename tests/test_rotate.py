@@ -1951,31 +1951,60 @@ class TestRedrawVisitsEachNodeOnce(unittest.TestCase):
     「换一个池子抽」在绕圈后失效，等于把「原地重摇 0/9」做了两遍。
     """
 
-    def test_redraw_cannot_exhaust_all_nodes(self):
-        """MAX_REDRAW 必须 >= 节点数，否则重摇还没绕完一圈就停了。
+    def test_redraw_budget_is_bounded_and_useful(self):
+        """MAX_REDRAW 的正确不变式：**够用**且**有界**。
 
-        注意方向：**跳过 skip 绕圈**是好事（8 节点时 MAX_REDRAW=8 已不绕圈），
-        但重摇本身仍受 MAX_REDRAW 限制，所以它不能小于节点数。
+        早先的断言是 `MAX_REDRAW >= len(NODES)` —— 那是 4 个节点时的写法，
+        含义是「重摇能把每个池子都试一遍」。节点扩到 45 之后它不再成立，
+        而且**也不该成立**：试遍 45 个池要 45 x 约 6 秒 = 270 秒，
+        而轮换间隔只有 10 分钟，一次轮换卡 4 分半是不可接受的。
+
+        真正要守的是两头：
+          下界 —— 至少能试好几个不同的池，否则「换一个池子抽」名存实亡
+          上界 —— 时间开销可控，否则一轮轮换能拖掉半个周期
         """
         import rotate as _r
-        self.assertGreaterEqual(_r.MAX_REDRAW, len(_r.NODES),
-                                "MAX_REDRAW=%d < 节点数=%d -> 重摇试不完一圈就停"
-                                % (_r.MAX_REDRAW, len(_r.NODES)))
+        self.assertGreaterEqual(_r.MAX_REDRAW, 4,
+                                "重摇至少要能试 4 个不同的池")
+        # 按实测每次重摇约 6 秒（切换 + 热重载 + 取 IP）
+        worst = _r.MAX_REDRAW * 6
+        self.assertLessEqual(worst, 120,
+                             "重摇最坏耗时 %ds，太长（轮换间隔 %d 分钟）"
+                             % (worst, _r.ROUND_INTERVAL_MIN))
 
-    def test_skip_returns_already_tried_nodes(self):
-        """证明 skip 确实会绕圈 —— 这是修它的理由，不是假设。"""
+    def test_redraw_does_not_always_start_from_the_head(self):
+        """重摇起点必须随轮次变化，否则只有 NODES 开头那几个会被碰到。
+
+        45 个节点时这是真问题：原来无论 live/target 是谁，重摇都只试前
+        10 个，其中任何一个若是持续故障节点，每次轮换都会先撞上它。
+        """
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("    tried = {live, target}")
+        blk = src[i:i + 2500]
+        self.assertIn("_probe_off", blk,
+                      "重摇必须从轮转起点开始找，不能永远从 NODES[0] 起")
+        self.assertIn('state.get("idx"', blk,
+                      "起点必须由轮次推导（相邻两轮试不同的一批）")
+
+    def test_redraw_search_still_skips_tried_nodes(self):
+        """轮转起点不改变「不重复试同一个节点」这条性质。"""
         import rotate as _r
-        st = {"idx": 0}
-        seq = [_r.pick_next(st, skip=k) for k in range(_r.MAX_REDRAW)]
-        want_wrap = _r.MAX_REDRAW > len(_r.NODES)
-        if want_wrap:
-            self.assertLess(len(set(seq)), len(seq),
-                            "MAX_REDRAW=%d > 节点数=%d 时 skip 必须绕圈"
-                            % (_r.MAX_REDRAW, len(_r.NODES)))
-        else:
-            # 重摇现在靠 `tried` 集合防重复，不再依赖 skip 绕圈，
-            # 所以「不绕圈」是**正确**状态，不是回归。
-            self.assertEqual(len(set(seq)), len(_r.NODES))
+        for off in (0, 3, 17, 44):
+            tried = {_r.NODES[0], _r.NODES[1]}
+            picked = []
+            for r in range(6):
+                start = (r + off) % len(_r.NODES)
+                nxt = next((_r.NODES[(start + k) % len(_r.NODES)]
+                           for k in range(len(_r.NODES))
+                           if _r.NODES[(start + k) % len(_r.NODES)] not in tried), None)
+                if nxt is None:
+                    break
+                tried.add(nxt)
+                picked.append(nxt)
+            self.assertEqual(len(picked), len(set(picked)),
+                             "off=%d 时重摇重复取了同一节点" % off)
+            self.assertNotIn(_r.NODES[0], picked)
+            self.assertNotIn(_r.NODES[1], picked)
 
     def test_rotate_source_tracks_tried_nodes(self):
         src = (ROOT / "rotate.py").read_text(encoding="utf-8")

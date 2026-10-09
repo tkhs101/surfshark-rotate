@@ -270,22 +270,65 @@ SECRET = os.environ.get("ROTATE_SECRET") or _secret_from_config(CONFIG_PATH)
 # 【顺序按实测延迟排，机器相关】各区域差异极大（同一台机器上 JP 可能 2ms
 # 而 SG 77ms）。换机器后用同目录的 measure-nodes.sh 重测再调整顺序。
 NODES = [
+    # 2026-10-09：从全部 138 个 Surfshark 机位里，按**生产实例实测**延迟
+    # 挑出 <200ms 的 45 个（jp-tok 8ms ... us-chi 199ms）。
+    #
+    # 【这份清单的由来值得记】最早我用**独立 mihomo 实例**测，得出「19/138 可用」，
+    # 并据此断言「美国全灭、澳门不可用」。全是错的 —— 独立实例里 138 个节点共用
+    # 同一个虚拟地址 10.14.0.2 与同一私钥，会话状态互相踩，测出来的 3000+ms 是
+    # 实例内耗不是线路延迟（同一时刻生产实例 jp-tok 只有 8ms，差 380 倍）。
+    # 换生产实例复测：137/138 可用。
+    #
+    # 教训两条：
+    #   1) **测量路径要和真实路径一致**。生产实例就是真实路径，我绕开它另起一个，
+    #      等于测了一个不存在的系统。
+    #   2) `/delay` 有随机失败，单次采样必然产生假阴性 —— 首轮判 35 个不可用，
+    #      复验时 33 个全部复活。定性必须多次采样 + 实测出口，不能靠单次。
     "JP 日本-东京",
     "KR 韩国-首尔",
-    "TW 台湾-台北",
     "SG 新加坡",
-    # 2026-10-09 加入的近邻节点：实测延迟与原四节点同档（3.0-3.5s），
-    # 各自出口 IP 池与原池不重叠 —— 12h 不重复的余量本来就靠「池子并集」
-    # 撑着，加节点是提升余量最直接的手段。
-    #
-    # mo-mfm（澳门）**测过但没加**：mihomo 报 alive=True，实际出口取不到；
-    # 且切过去会让整个 PROXY 组卡在 dial 10.14.0.2 ——
-    # 所有节点共用同一个虚拟地址，一个坏节点能拖垮全组。
-    # 这正是「alive 不等于能用」。
+    "TW 台湾-台北",
     "KH 柬埔寨-金边",
     "HK 香港",
     "PH 菲律宾-马尼拉",
     "VN 越南-胡志明",
+    "BN 文莱",
+    "MN 蒙古-乌兰巴托",
+    "LA 老挝-万象",
+    "MO 澳门",
+    "NP 尼泊尔-加德满都",
+    "BD 孟加拉-达卡",
+    "MM 缅甸-仰光",
+    "MY 马来西亚-吉隆坡",
+    "LK 斯里兰卡-科伦坡",
+    "PK 巴基斯坦-卡拉奇",
+    "US US-LAS-拉斯维加斯",
+    "US 美国-西雅图",
+    "US 美国-洛杉矶",
+    "AU 澳大利亚-悉尼",
+    "ID 印尼-雅加达",
+    "US 美国-圣何塞",
+    "US 美国-巴顿鲁日",
+    "US 美国-丹佛",
+    "TH 泰国-曼谷",
+    "US 美国-亚特兰大",
+    "CA 加拿大-温哥华",
+    "US 美国-凤凰城",
+    "BZ 伯利兹",
+    "US US-LTM-拉斯维加斯",
+    "US 美国-迈阿密",
+    "BS 巴哈马-拿骚",
+    "US 美国-旧金山",
+    "US 美国-阿什本",
+    "US 美国-夏洛特",
+    "US 美国-纽约",
+    "US 美国-底特律",
+    "MX 墨西哥-克雷塔罗",
+    "US 美国-奥马哈",
+    "AU 澳大利亚-阿德莱德",
+    "US 美国-达拉斯",
+    "US 美国-盐湖城",
+    "US 美国-芝加哥",
 ]
 # ============================================================
 
@@ -1444,6 +1487,8 @@ def rotate_once(dry_run=False):
     # 原地重摇实测接受率 0/9，绕圈重摇只是把同一个 0/9 做了两遍。
     # 现在显式记录本轮已试过的节点，试完一圈就停。
     tried = {live, target}
+    # 重摇起点按轮次轮转：相邻两轮不会总是先试同一批节点。
+    _probe_off = int(state.get("idx", 0) or 0)
     # ---- 候选准入：探测不过就不认这个 IP ----
     #
     # 【这里必须是唯一的准入点】早先把探测放在重摇分支里，结果只有
@@ -1471,7 +1516,10 @@ def rotate_once(dry_run=False):
                 log(f"    已试 {_try} 个候选全被拒 —— 本轮**不认**新 IP，"
                     f"保持节点 {target}")
                 return False
-            _n = next((n for n in NODES if n not in tried), None)
+            _ps = (_try + _probe_off) % len(NODES)
+            _n = next((NODES[(_ps + k) % len(NODES)]
+                       for k in range(len(NODES))
+                       if NODES[(_ps + k) % len(NODES)] not in tried), None)
             if _n is None:
                 log(f"    四个节点都试过了（{_try} 次）—— 本轮**不认**新 IP")
                 return False
@@ -1489,8 +1537,14 @@ def rotate_once(dry_run=False):
 
 
     while (new_ip in seen or (_vcmd and new_ip in rejected)) and redraws < MAX_REDRAW:
-        nxt = next((n for n in NODES
-                    if n not in tried), None)
+        # 从一个**轮转起点**开始找，而不是永远从 NODES[0] 起。
+        # 节点从 4 扩到 45 之后这成了真问题：原来无论 live/target 是谁，
+        # 重摇都只会试前 10 个节点，其中任何一个若是持续故障节点，
+        # 每次轮换都会先撞上它。
+        _start = (redraws + _probe_off) % len(NODES)
+        nxt = next((NODES[(_start + k) % len(NODES)]
+                    for k in range(len(NODES))
+                    if NODES[(_start + k) % len(NODES)] not in tried), None)
         if nxt is None:
             log(f"    四个节点的池子都试过了（已重摇 {redraws} 次）—— 停止，"
                 f"本轮接受 {new_ip}")
