@@ -1302,6 +1302,8 @@ def rotate_once(dry_run=False):
             f"窗口内已用 {used} 个地址。")
         log(f"      若这经常发生，说明间隔太长或池子太小："
             f"12h 需要 {720 // max(1, ROUND_INTERVAL_MIN)} 个不同地址。")
+        exhausted = (f"{redraws} 次重摇仍撞上 {RECENT_WINDOW_H}h 内用过的地址"
+                     f"（窗口内已用 {len(seen)} 个）")
     elif redraws:
         log(f"    重摇 {redraws} 次后拿到 {RECENT_WINDOW_H}h 内未用过的地址 ✓")
 
@@ -1324,7 +1326,8 @@ def rotate_once(dry_run=False):
             rot_log = rot_log[-500:]
     update_state({"last_ip": new_ip, "idx": state["idx"],
                   "recent": state.get("recent", []),
-                  "rot_log": rot_log},
+                  "rot_log": rot_log,
+                  "last_redraw_failed": locals().get("exhausted", "")},
                  require_existing=False)
     log(f"--- 完成 | 节点={target} | IP={new_ip} | "
         f"{RECENT_WINDOW_H}h 内已用 {len(state['recent'])} 个地址 ---")
@@ -1374,10 +1377,11 @@ def show_status():
     # 与上一轮修掉的 same_ip_streak 假告警是同一个毛病，只换了张脸。
     # 有意义的问题是「**除了刚用过的这个**，还剩多少可用」。
     spare = used - {ip, st.get("last_ip")}
-    log(f"轮换产出 : 窗口内已用 {len(used)} 个地址，"
+    log(f"轮换产出 : 已换过 {int(st.get('idx', 0))} 轮；"
+        f"窗口内已用 {len(used)} 个地址，"
         f"当前 {ip or '(未知)'} 之外还有 {len(spare)} 个没用过")
     if len(spare) <= 0:
-        log(f"⚠ 已无「{RECENT_WINDOW_H}h 内未用过」的地址 —— 池子抽干了。"
+        log("⚠ 已经没有任何未用过的地址 —— 池子抽干了。"
             f"重摇不可能成功；需要加节点或放长间隔。")
     log(f"12h 预算 : 需 {need} 个不同地址 / 窗口内已用 {len(used)} / "
         f"间隔 {ROUND_INTERVAL_MIN} 分钟")
@@ -1415,6 +1419,32 @@ def show_status():
         log(f"IP 反查  : 不可用（{LEAK_HOST} 解析失败）—— 本次判定只按域名匹配，")
         log("           而 sniffer 失效正是要覆盖的场景之一。")
     log(f"当前节点位 : {(int(st.get('idx', 0)) - 1) % len(NODES) + 1} / {len(NODES)}")
+
+    # 【为什么这些以前不在 --status 里】它们由 rotate.py 写、由 status.sh 读，
+    # 于是形成两个读者而 --status 是不完整的那个。后果不只是信息缺失：
+    # watchdog.sh 照着 status.sh 的文案去 grep --status 的输出，
+    # 其中多条**永远不可能命中**（「正在泄漏」「分流规则异常」「无法核对」
+    # 只在 status.sh 里出现）。现在 --status 直接报全，
+    # 判据的解释权收回状态文件 owner 这一侧。
+    if st.get("routing_bad_at"):
+        log(f"!! 分流规则异常 : {st.get('routing_bad_reason') or '(无详情)'}"
+            f"（记录于 {st.get('routing_bad_at')}）—— opencode.ai 不走 AUTOFALL，"
+            f"会把本机 IP 泄漏出去")
+    if st.get("routing_unknown_at"):
+        log(f"?? 分流规则无法核对 : {st.get('routing_unknown_reason') or '(无详情)'}"
+            f" —— 此刻既没有泄漏证据，也没有「规则正常」的证据")
+    if st.get("last_redraw_failed"):
+        log(f"⚠ 重摇仍撞上 : {st.get('last_redraw_failed')}")
+
+    # 停摆：定时器没在跑。status.sh 一直在报，--status 没有 —— 而 watchdog 读的是 --status。
+    try:
+        _ta = subprocess.run(["systemctl", "is-active", ROTATE_TIMER],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+    except Exception:
+        _ta = ""
+    if _ta and _ta != "active":
+        log(f"⚠ 轮换停摆 : {ROTATE_TIMER} 不是 active（{_ta}）")
+
     log(f"配置路径 : {CONFIG_PATH} ({'存在' if os.path.exists(CONFIG_PATH) else '不存在'})")
 
 

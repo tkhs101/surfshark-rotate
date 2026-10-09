@@ -80,6 +80,9 @@ install -m 0755 "$SRC/cleanup-routes.sh"  "$BASE/cleanup-routes.sh"
 # mihomo.service 的 ExecStartPost 指向它。漏装的后果不是报错，而是
 # 「密钥换好了但轮换定时器永远是停的」——需要翻半天日志才发现。
 install -m 0755 "$SRC/on-mihomo-up.sh"     "$BASE/on-mihomo-up.sh"
+# 看门狗：只出声不修复。早先它没被安装，于是整个特性**一个字节都不会运行** ——
+# 而提交信息把它列为已交付。教训：加了新单元就必须同时进安装与卸载。
+install -m 0755 "$SRC/watchdog.sh"         "$BASE/watchdog.sh"
 # 状态速查与卸载脚本也必须落到 $BASE。安装完成的提示里让用户直接跑
 # status.sh，而它并不在上传目录里 —— 交付时漏装，用户照着提示执行会得到
 # "No such file or directory"。实测踩过。
@@ -366,6 +369,8 @@ step "5/9  安装 systemd 单元"
 install -m 0644 "$SRC/mihomo.service"              /etc/systemd/system/mihomo.service
 install -m 0644 "$SRC/surfshark-rotate.service"    /etc/systemd/system/surfshark-rotate.service
 install -m 0644 "$SRC/surfshark-rotate.timer"      /etc/systemd/system/surfshark-rotate.timer
+install -m 0644 "$SRC/surfshark-watchdog.service"  /etc/systemd/system/surfshark-watchdog.service
+install -m 0644 "$SRC/surfshark-watchdog.timer"    /etc/systemd/system/surfshark-watchdog.timer
 install -m 0644 "$SRC/README.md"                   "$BASE/README.md" 2>/dev/null || true
 
 systemctl daemon-reload
@@ -680,6 +685,7 @@ fi
 step "9/9  启用轮换定时器"
 # ==============================================================
 systemctl enable --now surfshark-rotate.timer >/dev/null
+systemctl enable --now surfshark-watchdog.timer >/dev/null
 c_ok "  ✓ 定时器已启用，每 5 分钟一轮"
 
 printf '\n'

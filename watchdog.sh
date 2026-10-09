@@ -25,14 +25,25 @@ reasons=()
 # 去掉颜色码再匹配；只认「真正需要注意」的那几类
 clean="$(printf '%s' "$STATUS" | sed 's/\x1b\[[0-9;]*m//g')"
 
-grep -q '^.*降级状态 : 是' <<< "$clean" && reasons+=("处于降级态：opencode.ai 正在走直连（出口是本机 IP）")
-grep -q '正在泄漏' <<< "$clean" && reasons+=("检测到 opencode.ai 的连接走直连")
-grep -q '分流规则异常' <<< "$clean" && reasons+=("分流规则异常：opencode.ai 不走 AUTOFALL")
-grep -q '无法核对' <<< "$clean" && reasons+=("分流规则无法核对：判据本身失效，此刻无法判断")
-grep -q '停摆' <<< "$clean" && reasons+=("轮换停摆：定时器没在跑，或 AUTOFALL 卡住")
+# 【每条模式都必须对得上 --status 的真实输出】
+# 上一版有三条永远不可能命中：我照着 status.sh 的文案写，却去 grep --status 的
+# 输出 ——「正在泄漏」「分流规则异常」「无法核对」只在 status.sh 里出现。
+# 现在 rotate.py --status 直接报全（它是状态文件的解释 owner），
+# 下面的模式与它一一对应，并由 TestWatchdogPatternsMatchRealOutput 守着。
+grep -q '降级状态 : 是' <<< "$clean" && reasons+=("处于降级态：opencode.ai 正在走直连（出口是本机 IP）")
+grep -q '!! 分流规则异常' <<< "$clean" && reasons+=("分流规则异常：opencode.ai 不走 AUTOFALL")
+grep -q '分流规则无法核对' <<< "$clean" && reasons+=("分流规则无法核对：判据本身失效，此刻无法判断")
+grep -q '重摇仍撞上' <<< "$clean" && reasons+=("重摇用尽仍撞上窗口内用过的地址")
+grep -q '!! 有 [0-9]* 条 opencode.ai 连接走 DIRECT' <<< "$clean" && reasons+=("检测到 opencode.ai 的连接走直连")
 grep -q 'IP 反查  : 不可用' <<< "$clean" && reasons+=("泄漏检测半盲：按 IP 反查不可用，只按域名匹配")
-grep -q '池子抽干' <<< "$clean" && reasons+=("出口地址池已抽干，12h 内无法再取到未用过的地址")
-grep -q '重摇 [0-9]* 次仍撞上' <<< "$clean" && reasons+=("重摇用尽仍撞上窗口内用过的地址")
+grep -q '轮换停摆' <<< "$clean" && reasons+=("轮换停摆：定时器没在跑，或 AUTOFALL 卡住")
+grep -q '12h 预算' <<< "$clean" || reasons+=("读不到 12h 预算 —— 判据来源可能失效")
+# 「池子抽干」只在确实轮换过、且 now 无 spare 时才算数。
+# 早先无条件 grep 那句，全新安装（只有 1 条记录、last_ip=None）时
+# spare 为空集 -> **刚装好的机器第一轮就喊「地址池已抽干」**。
+if grep -q '已经没有任何未用过的地址' <<< "$clean" && grep -q '已换过' <<< "$clean"; then
+    reasons+=("出口地址池已抽干，12h 内无法再取到未用过的地址")
+fi
 
 now="$(date -Is)"
 
@@ -54,7 +65,10 @@ fi
 
 # 只在「原因集合变了」时才喊进 journal，否则每 5 分钟刷一次同样的内容
 prev="$(cat "$STATE" 2>/dev/null || true)"
-cur="$(printf '%s' "${reasons[@]}")"
+# 用换行连接而不是直接拼：printf '%s' 拼接会让 [ab,c] 与 [a,bc] 得到同一个值，
+# 于是「原因变了但 prev==cur」而静默不报。
+cur="$(printf '%s
+' "${reasons[@]}")"
 if [ "$prev" != "$cur" ]; then
     say "⚠ 需要人工关注："
     for r in "${reasons[@]}"; do say "  · $r"; done

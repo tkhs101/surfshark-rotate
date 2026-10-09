@@ -18,6 +18,7 @@ step() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
 
 step "1/4  停止并取消开机自启"
 systemctl disable --now surfshark-rotate.timer 2>/dev/null || true
+systemctl disable --now surfshark-watchdog.timer 2>/dev/null || true
 systemctl stop surfshark-rotate.service 2>/dev/null || true
 systemctl disable mihomo.service 2>/dev/null || true
 systemctl stop mihomo.service 2>/dev/null || true
@@ -37,6 +38,8 @@ step "3/4  移除 systemd 单元"
 rm -f /etc/systemd/system/mihomo.service \
       /etc/systemd/system/surfshark-rotate.service \
       /etc/systemd/system/surfshark-rotate.timer
+      /etc/systemd/system/surfshark-watchdog.service
+      /etc/systemd/system/surfshark-watchdog.timer
 systemctl daemon-reload
 systemctl reset-failed 2>/dev/null || true
 c_ok "  ✓ 单元已移除"

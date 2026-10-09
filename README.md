@@ -37,6 +37,7 @@ VPS 整机流量
 |---|---|
 | `mihomo.service` | 内核常驻，`Restart=always` |
 | `surfshark-rotate.timer` | **那个 24 小时循环**，每 10 分钟触发一次 `surfshark-rotate.service` |
+| `surfshark-watchdog.timer` | **看门狗**，每 5 分钟一次，**只出声不修复**。有需要关注的状态就写 `.alert` 文件并在 journal 出声 |
 | （降级时会临时起一个一次性单元） | 节点恢复后的复查，见[降级与恢复](#降级与恢复) |
 
 **AUTOFALL 是降级链**：节点不可用时 `opencode.ai` 会退到直连（还能用，只是出口变回本机），

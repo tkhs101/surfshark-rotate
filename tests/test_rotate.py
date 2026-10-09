@@ -1751,9 +1751,20 @@ class TestReadmeMatchesReality(unittest.TestCase):
         return (ROOT / "README.md").read_text(encoding="utf-8")
 
     def test_no_stale_five_minute_claims(self):
-        self.assertNotIn("每 5 分钟", self._readme(),
-                         "间隔已改为 10 分钟，README 仍在说 5 分钟")
-        self.assertNotIn("每 5 分钟自动换", self._readme())
+        """只管**轮换**的间隔表述 —— watchdog 确实就是每 5 分钟，不在其列。
+
+        早先这里是无脑 `assertNotIn("每 5 分钟")`，加上 watchdog 那行之后
+        就开始误报了。与其把断言放宽，不如把范围说清楚。
+        """
+        import re
+        for line in self._readme().split(chr(10)):
+            if "每 5 分钟" not in line:
+                continue
+            self.assertNotIn("出口", line,
+                             "轮换间隔已改为 10 分钟，README 仍在说 5 分钟：%s"
+                             % line.strip()[:60])
+            self.assertNotIn("轮换", line,
+                             "轮换间隔已改为 10 分钟：%s" % line.strip()[:60])
 
     def test_declared_interval_matches_timer(self):
         import rotate as _r
@@ -1803,6 +1814,118 @@ class TestRepeatRateIsHonest(unittest.TestCase):
         blk = src[i:src.index("def main(", i)]
         self.assertIn("承诺要到 12 小时后才算数", blk,
                       "窗口没跑满时不能让人以为已经达标")
+
+
+class TestWatchdogPatternsMatchRealOutput(unittest.TestCase):
+    """watchdog 不得再出现「只存在于 status.sh」的文案。
+
+    上一版 8 条 grep 里有 3 条永远不可能命中：那些串只出现在 `status.sh`，
+    而 watchdog 读的是 `rotate.py --status` 的输出。评审用假 mihomo 造 8 个
+    场景实跑 --status 逐条比对才找出来。
+
+    这里不试图「证明每条都能命中」—— 那需要真的跑起整套状态机。
+    改为锁住**已确认的死模式**不许回来，并把 --status 必须报出那些事实钉住。
+    """
+
+    def _patterns(self):
+        import re
+        src = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        return re.findall(r"grep -q '([^']+)'", src)
+
+    def test_known_dead_patterns_are_gone(self):
+        pats = self._patterns()
+        # 精确匹配而不是子串 ——「分流规则无法核对」里含有「无法核对」三个字，
+        # 但前者是**有效的**（--status 确实会打印它），后者才是死模式。
+        dead = {
+            "正在泄漏": "只在 status.sh 里；--status 说的是「泄漏检测」",
+            "重摇 [0-9]* 次仍撞上": "只在 rotate_once 的 journal 里，从不进 --status",
+        }
+        for pat in pats:
+            for frag, why in dead.items():
+                self.assertNotIn(frag, pat,
+                                 "watchdog 又用了 %r（%s）—— 这条 grep 永远不可能命中"
+                                 % (frag, why))
+        # 旧的裸 `无法核对` 与裸 `分流规则异常` 也不该回来
+        self.assertNotIn("无法核对", pats,
+                         "--status 用的是「分流规则无法核对」，裸串打不中")
+        self.assertIn("分流规则无法核对", pats)
+        self.assertIn("重摇仍撞上", pats)
+
+    def test_status_reports_the_facts_watchdog_needs(self):
+        """--status 必须报出 watchdog 依赖的那几件事。
+
+        它们以前由 rotate.py 写、由 status.sh 读，形成两个读者而 --status
+        是不完整的那个 —— 这正是那些 grep 打空的原因。
+        """
+        rot = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = rot.index("def show_status")
+        blk = rot[i:rot.index(chr(10) + "def main(", i)]
+        for needed in ("routing_bad_at", "routing_unknown_at",
+                       "last_redraw_failed", "direct_leaks()",
+                       "_leak_ip_lookup_ok()", "ROTATE_TIMER"):
+            self.assertIn(needed, blk,
+                          "--status 不报 %s，而 watchdog 依赖它" % needed)
+
+    def test_pool_exhaustion_needs_prior_rotation(self):
+        """「池子抽干」必须同时有「已换过 N 轮」，否则新装的机器第一轮就喊。
+
+        `spare = used - {ip, last_ip}` 在只有一条记录时得空集。
+        """
+        self.assertIn("已换过", self._patterns() and
+                      (ROOT / "rotate.py").read_text(encoding="utf-8"))
+        wd = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        self.assertIn("已经没有任何未用过的地址", wd)
+        self.assertIn("已换过", wd, "抽干判据必须同时检查是否真的轮换过")
+
+
+class TestRunShGuardsMinimumCount(unittest.TestCase):
+    """tests/run.sh 必须检查用例数下限，不能只看「出现过 Ran N」。
+
+    评审实测：伪造一个只打印 `Ran 999 tests` + `OK`、零用例的套件，
+    旧版 run.sh **exit=0 并打印 OK**。这与「套件没跑」是同形漏洞。
+    """
+
+    def test_run_sh_checks_a_minimum(self):
+        import re
+        src = (ROOT / "tests/run.sh").read_text(encoding="utf-8")
+        self.assertTrue(re.search(r"-lt\s+\d+|MIN_", src),
+                        "run.sh 没有用例数下限检查 —— 伪造 'Ran 999 tests' 能骗过它")
+
+    def test_minimum_is_below_current_count(self):
+        import re
+        src = (ROOT / "tests/run.sh").read_text(encoding="utf-8")
+        m = re.search(r"MIN_TESTS=(\d+)", src)
+        self.assertIsNotNone(m)
+        self.assertLess(int(m.group(1)), 100,
+                        "下限高于实际用例数，会把真实的套件也判成异常")
+
+
+class TestWatchdogIsActuallyWired(unittest.TestCase):
+    """加了新单元就必须同时进安装与卸载。
+
+    早先 watchdog.sh / 两个 unit 文件写完了、也部署到机器上了，
+    但 `install.sh` 没装它、`README` 没提它、`uninstall.sh` 不清它 ——
+    于是整个特性**在一台全新安装的机器上不会运行**，而提交信息把它列为已交付。
+    """
+
+    def _n(self, f):
+        return (ROOT / f).read_text(encoding="utf-8")
+
+    def test_install_ships_watchdog(self):
+        ins = self._n("install.sh")
+        self.assertIn("watchdog.sh", ins, "install.sh 没装 watchdog.sh")
+        self.assertIn("surfshark-watchdog.service", ins)
+        self.assertIn("surfshark-watchdog.timer", ins)
+        self.assertIn("enable --now surfshark-watchdog.timer", ins,
+                      "装完必须 enable，否则又是一个不会运行的东西")
+
+    def test_uninstall_removes_watchdog(self):
+        un = self._n("uninstall.sh")
+        self.assertIn("disable --now surfshark-watchdog.timer", un)
+        self.assertIn("/etc/systemd/system/surfshark-watchdog.service", un)
+
+    def test_readme_mentions_watchdog(self):
+        self.assertIn("watchdog", self._n("README.md"))
 
 
 if __name__ == "__main__":
