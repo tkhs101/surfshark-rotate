@@ -397,3 +397,35 @@ VERIFY_CMD='magpie provider test opencode-zen-free'   # 退出码 0 = 通过
 探测走同一个 mixed-port（`listeners` 未启用，没有独立出口），
 所以探测期间 AUTOFALL 确实短暂停在候选 IP 上 ——
 但这比原行为严格更好：原行为让一个随机 IP 扛 10 分钟，探测只让它扛几秒。
+
+### 黑名单与 429 钩子
+
+```bash
+# 上报一次 429：拉黑该 IP（缺省用当前出口）并立即轮换
+rotate.py --report-429 [IP]
+```
+
+黑名单与 `recent` 一样按 **12 小时**滚动失效（`BLACKLIST_TTL_H`），
+到期自动清理。客户端/包装脚本在拿到 429 时调一次即可闭环：
+
+```bash
+curl -s ... -o /dev/null -w '%{http_code}' ... | grep -q 429 && rotate.py --report-429
+```
+
+**只有明确的限流信号才拉黑**（429 / rate limit / quota exceeded）。
+超时、DNS 失败、连接被拒一律不拉 —— 把好 IP 拉黑 12h 的代价比重试一次大得多。
+
+钩子与定时器用 `flock` 互斥；拉黑**先落盘再轮换**，
+即使轮换失败也不会丢掉拉黑记录（否则下一次又会抽回同一个脏 IP）。
+
+### 开启「先测再用」
+
+放一个 `verify.cmd` 即可，不必改代码 —— 探测要不要花钱是部署决定：
+
+```bash
+echo 'sudo -n -u tkhs /usr/local/bin/magpie provider test opencode-zen-free' \
+  > /opt/surfshark-rotate/verify.cmd
+chmod 755 /opt/surfshark-rotate/verify.cmd
+```
+
+退出码 0 = 通过。文件不存在 = 关闭。

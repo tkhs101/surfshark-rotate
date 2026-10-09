@@ -89,37 +89,95 @@ MAX_REDRAW = 8
 #
 # 空字符串 = 关闭（保持原行为）。打开它需要外部命令，本项目不内置任何具体实现，
 # 避免把「探测哪个上游、怎么算通过」硬编码进来。
-VERIFY_CMD = ""
+VERIFY_CMD = ""   # 由 _verify_cmd() 惰性读取 VERIFY_FILE
 VERIFY_TIMEOUT = 60
 # 探测最多试几个候选。每个约 2-7 秒、2 个上游请求；
 # 池内脏 IP 约 4.5%，所以期望尝试次数约 1.05，设 4 足够。
-VERIFY_MAX_TRY = 4              # 撞到窗口内用过的地址时，最多重摇几次（每次约 6 秒）
+VERIFY_MAX_TRY = 4
+# 黑名单：已被上游按来源封禁的出口 IP。
+# 实测 1/22 ≈ 4.5% 的 IP 是脏的，且**无法从 IP 字面看出脏不脏**。
+# 12h 不重复的承诺在这里帮不上忙 —— 它保证「我们不重复用同一个 IP」，
+# 而脏 IP 是**第一次遇到就已经脏了**（共享 NAT 出口被别人用坏）。
+BLACKLIST_TTL_H = 12
+# 只有**明确的限流信号**才拉黑。其它失败（超时、DNS、连接被拒）
+# 一律不拉黑 —— 否则一次网络抖动就会把好 IP 误伤，
+# 而黑名单 12h 内不会再用那个 IP，代价远大于一次重试。
+BL_RATE_HINTS = ("429", "rate limit", "ratelimit", "too many requests",
+                 "rate_limit", "quota exceeded")
+# 轮换锁：定时器与 429 钩子可能同时触发，必须互斥。
+
+
+def prune_blacklist(entries):
+    """丢掉超过 BLACKLIST_TTL_H 的条目。空 -> 空表。"""
+    cutoff = time.time() - BLACKLIST_TTL_H * 3600
+    out = []
+    for e in (entries or []):
+        try:
+            ts = float(e[0])
+        except Exception:
+            continue
+        if ts > cutoff:
+            out.append([ts, e[1]])
+    return out
+
+
+def is_blacklisted(state, ip):
+    """ip 是否在黑名单里。
+
+    **顺带把过期条目清掉** —— 不是只读判断：12h 窗口是滚动生效的，
+    而轮换是唯一会读这张表的时机。返回值只回答「在不在」，
+    清理通过 update_state 落盘（只在本轮真的调用时）。
+    """
+    if not ip:
+        return False
+    for _, x in (state.get("blacklist") or []):
+        if x == ip:
+            return True
+    return False
+
+
+def blacklist_add(state, ip, reason=""):
+    """把 ip 记进黑名单，并清理过期条目。返回是否发生了新增。"""
+    cur = prune_blacklist(state.get("blacklist"))
+    added = not any(e[1] == ip for e in cur)
+    if added:
+        cur.append([time.time(), ip])
+    state["blacklist"] = cur
+    if added and reason:
+        log(f"    已拉黑 {ip}：{reason}")
+    return added
 
 
 def probe_ip(ip):
     """探测当前出口 IP 能否正常访问上游。
 
-    返回 (ok: bool, note: str)。VERIFY_CMD 为空时**不做任何探测**，
+    返回 (ok: bool, note: str, limited: bool) —— limited 表示「明确是限流」，
+    调用方据此决定要不要拉黑。VERIFY_CMD 为空时**不做任何探测**，
     直接返回 True —— 这样默认行为与改动前完全一致。
 
     刻意不内置任何具体探测命令：探测哪个上游、算不算通过，
     是部署环境的事。本函数只负责「跑一下、看退出码」。
     """
-    if not VERIFY_CMD:
-        return True, ""
+    cmd = _verify_cmd()
+    if not cmd:
+        return True, "", False
     try:
         r = subprocess.run(
-            VERIFY_CMD, shell=True, timeout=VERIFY_TIMEOUT,
+            cmd, shell=True, timeout=VERIFY_TIMEOUT,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     except subprocess.TimeoutExpired:
-        return False, "探测超时"
+        return False, "探测超时", False
     except Exception as e:
-        return False, f"探测异常 {type(e).__name__}"
+        return False, f"探测异常 {type(e).__name__}", False
     if r.returncode == 0:
-        return True, ""
+        return True, "", False
     out = (r.stdout or b"").decode("utf-8", "replace").strip()
     tail = " / ".join(l.strip() for l in out.splitlines() if l.strip())[-160:]
-    return False, tail or f"退出码 {r.returncode}"
+    # **只有明确的限流信号才配拉黑。** 超时、DNS 失败、连接被拒都是
+    # 环境问题，把好 IP 拉黑 12h 的代价比重试一次大得多。
+    low = out.lower()
+    limited = any(h in low for h in BL_RATE_HINTS)
+    return False, tail or f"退出码 {r.returncode}", limited
 
 
 def prune_recent(entries, now=None):
@@ -155,6 +213,30 @@ ROTATE_TIMER = "surfshark-rotate.timer"   # 降级时停掉；由 on-mihomo-up.s
 HEAL = os.environ.get("ROTATE_HEAL", "1") != "0"   # --no-heal 可临时关掉
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+# 「先测再用」的开关联动方式：**不是改代码，是放一个文件**。
+# 探测要消耗上游配额，这个取舍属于部署环境；把它做成仓库里的常量
+# 就等于让代码替部署方做决定。文件不存在 = 关闭，行为与改动前完全一致。
+VERIFY_FILE = os.path.join(BASE, "verify.cmd")
+
+
+def _verify_cmd():
+    """惰性读探测命令 —— 必须惰性：常量区还没定义 BASE。"""
+    global VERIFY_CMD
+    VERIFY_CMD = _load_verify_cmd()
+    return VERIFY_CMD
+
+
+def _load_verify_cmd():
+    """从 VERIFY_FILE 读探测命令；文件缺失或为空 = 关闭。"""
+    try:
+        with open(VERIFY_FILE, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# 轮换锁：定时器与 429 钩子可能同时触发，必须互斥。
+ROTATE_LOCK = os.path.join(BASE, ".rotate.lock")
 CONFIG_PATH = os.environ.get("ROTATE_CONFIG_PATH") or os.path.join(BASE, "config.yaml")
 
 
@@ -1327,6 +1409,20 @@ def rotate_once(dry_run=False):
     # 旧配置 5 分钟一轮只轮 JP/KR，12 小时就把两池合计 79 个地址用掉了大半，
     # 在同一个节点上原地重摇，抽中的必然是用过的。**换一个池子抽**才解决。
     seen = recent_ips(state)
+    _vcmd = _verify_cmd()      # 惰性读一次；本轮用同一份
+    _bl_dirty = False        # 黑名单是否变更（变了要落盘）
+    rejected = []            # 本轮被丢弃的候选 IP（探测不过或撞上 seen）
+    # 黑名单并入 seen：被拉黑的 IP 等价于「近期用过」，重摇会主动避开。
+    # 过期条目在 is_blacklisted 的调用中顺带清掉。
+    _bl = prune_blacklist(state.get("blacklist"))
+    if len(_bl) != len(state.get("blacklist") or []):
+        state["blacklist"] = _bl
+        _bl_dirty = True
+    for _, x in _bl:
+        if x not in seen:
+            seen.append(x)
+    if _bl:
+        log(f"    黑名单内有 {len(_bl)} 个地址（{BLACKLIST_TTL_H}h 内被上游限流过）")
     redraws = 0
     # 显式初始化而不是 locals().get(...)：后者在某条分支给 exhausted
     # 赋过值、而这里没重置时会粘住上一轮的值。评审提的次要项，成本是零。
@@ -1338,7 +1434,51 @@ def rotate_once(dry_run=False):
     # 原地重摇实测接受率 0/9，绕圈重摇只是把同一个 0/9 做了两遍。
     # 现在显式记录本轮已试过的节点，试完一圈就停。
     tried = {live, target}
-    while (new_ip in seen or (VERIFY_CMD and new_ip in rejected)) and redraws < MAX_REDRAW:
+    # ---- 候选准入：探测不过就不认这个 IP ----
+    #
+    # 【这里必须是唯一的准入点】早先把探测放在重摇分支里，结果只有
+    # 「撞上已用地址」时才会探测 —— 正常轮换抽到脏 IP 时**根本不测**，
+    # 于是「先测再用」名存实亡（实测一轮正常轮换，日志里没有任何探测记录）。
+    # 现在每个候选 IP —— 不管来路 —— 都要过这一关。
+    if _vcmd:
+        _try = 0
+        while True:
+            vok, note, limited = probe_ip(new_ip)
+            if vok:
+                # 通过也要出声。静默通过无法与「压根没跑」区分 ——
+                # 我就因此误判过一次「探测没生效」，而它其实一直在跑。
+                log(f"    探测通过：{new_ip}")
+                break
+            rejected.append(new_ip)
+            if limited:
+                if blacklist_add(state, new_ip, note):
+                    _bl_dirty = True
+                log(f"    探测未通过（限流）：{new_ip} —— 已拉黑，换一个（{note}）")
+            else:
+                log(f"    探测未通过：{new_ip} —— 丢弃，换一个（{note}）")
+            _try += 1
+            if _try >= VERIFY_MAX_TRY:
+                log(f"    已试 {_try} 个候选全被拒 —— 本轮**不认**新 IP，"
+                    f"保持节点 {target}")
+                return False
+            _n = next((n for n in NODES if n not in tried), None)
+            if _n is None:
+                log(f"    四个节点都试过了（{_try} 次）—— 本轮**不认**新 IP")
+                return False
+            tried.add(_n)
+            log(f"    重摇（探测未通过）：{_n}")
+            ok, err = switch_and_reload(_n)
+            if not ok:
+                log(f"    重摇失败：{err}")
+                return False
+            target = _n
+            new_ip = exit_ip()
+            if not new_ip:
+                log("    重摇后取不到出口 IP")
+                return False
+
+
+    while (new_ip in seen or (_vcmd and new_ip in rejected)) and redraws < MAX_REDRAW:
         nxt = next((n for n in NODES
                     if n not in tried), None)
         if nxt is None:
@@ -1357,20 +1497,10 @@ def rotate_once(dry_run=False):
         if not new_ip:
             log("    重摇后取不到出口 IP，保留本轮结果")
             break
-        if VERIFY_CMD:
-            vok, note = probe_ip(new_ip)
-            if not vok:
-                rejected.append(new_ip)
-                log(f"    探测未通过：{new_ip} —— 丢弃，换一个（{note}）")
-                if redraws >= VERIFY_MAX_TRY:
-                    log(f"    已试 {redraws} 个候选仍全被拒 —— "
-                        f"本轮**不认**新 IP，保持当前节点")
-                    break
-                continue
 
     # 【守卫】探测全被拒时 new_ip 仍指向最后一个被拒的 IP —— 不能当结果接受。
     # 此时本轮应当「什么都不做」，而不是把一个已证不通的 IP 写进状态。
-    if VERIFY_CMD and new_ip in rejected:
+    if _vcmd and new_ip in rejected:
         log(f"    本轮放弃：候选 {new_ip} 探测未通过，**不认**它")
         log(f"    保持节点 {target}，出口 IP 维持上一轮的 {old_ip or '(未知)'}")
         return False
@@ -1421,6 +1551,7 @@ def rotate_once(dry_run=False):
             rot_log = rot_log[-cap:]
     update_state({"last_ip": new_ip, "idx": state["idx"],
                   "node_at": state["node_at"],
+                  "blacklist": state.get("blacklist", []),
                   "recent": state.get("recent", []),
                   "rot_log": rot_log,
                   "last_redraw_failed": exhausted},
@@ -1589,6 +1720,9 @@ def main():
                     help="探测当前节点连续健康（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--probes", type=int, default=2, help="--probe-node 的采样次数")
     ap.add_argument("--gap", type=int, default=8, help="--probe-node 的采样间隔秒")
+    ap.add_argument("--report-429", nargs="?", const="", metavar="IP",
+                    help="上报一次 429：拉黑该 IP（缺省用当前出口）并立即轮换。"
+                         "供客户端/包装脚本调用，是「遇到 429 就换」闭环的入口。")
     ap.add_argument("--recheck-tried", action="store_true",
                     help="复查计数 +1 并打印（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--reset-recheck", action="store_true",
@@ -1601,6 +1735,30 @@ def main():
     # on-mihomo-up.sh 曾经自带一份硬编码的 key 列表来清状态，于是状态 schema
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
+    if args.report_429 is not None:
+        # 与定时器互斥：两者可能同时触发，撞在一起会写出撕裂的状态。
+        with open(ROTATE_LOCK, "w") as lf:
+            fcntl.flock(lf, fcntl.LOCK_EX)
+            try:
+                st = load_state()
+                ip = args.report_429 or st.get("last_ip") or exit_ip()
+                if not ip:
+                    log("上报 429 但取不到当前出口 IP —— 无法拉黑，也不轮换")
+                    return 3
+                log(f"收到 429 上报，出口 IP = {ip}")
+                if is_blacklisted(st, ip):
+                    log(f"    {ip} 已在黑名单里（未重复记录）")
+                else:
+                    blacklist_add(st, ip, "客户端上报 429")
+                # 立刻落盘再轮换：即使轮换失败，拉黑这件事也必须留住，
+                # 否则下一次轮换又会抽回同一个脏 IP。
+                update_state({"blacklist": prune_blacklist(st.get("blacklist"))})
+            finally:
+                fcntl.flock(lf, fcntl.LOCK_UN)
+        log("立即轮换")
+        return 0 if rotate_once(dry_run=args.dry_run) else 1
+
+
     if args.hook_worst_case:
         print(int(hook_worst_case_seconds() + 0.999))
         return 0

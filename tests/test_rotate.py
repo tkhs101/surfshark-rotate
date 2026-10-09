@@ -2444,11 +2444,22 @@ class TestProbeBeforeUse(unittest.TestCase):
         return "%s %s" % (sys.executable, f.name)
 
     def _with(self, cmd, **kw):
-        import rotate as _r
-        olds = {k: getattr(_r, k) for k in ("VERIFY_CMD", "VERIFY_TIMEOUT")}
-        setattr(_r, "VERIFY_CMD", cmd)
-        for k, v in kw.items():
-            setattr(_r, k, v)
+        """通过 VERIFY_FILE 注入，而不是 patch 常量。
+
+        开关已经改成「放一个文件」（探测要不要花钱是部署决定，
+        不该由代码里的常量替部署方回答），所以代码走惰性读取 ——
+        测试若还 patch VERIFY_CMD 就测不到真实路径了。
+        """
+        import rotate as _r, tempfile, os
+        f = tempfile.NamedTemporaryFile("w", suffix=".cmd", delete=False)
+        f.write(cmd)
+        f.close()
+        self.addCleanup(os.unlink, f.name)
+        olds = {"VERIFY_FILE": _r.VERIFY_FILE, "VERIFY_CMD": _r.VERIFY_CMD,
+                "VERIFY_TIMEOUT": _r.VERIFY_TIMEOUT}
+        _r.VERIFY_FILE = f.name
+        _r.VERIFY_CMD = ""
+        _r.VERIFY_TIMEOUT = kw.get("VERIFY_TIMEOUT", _r.VERIFY_TIMEOUT)
         def restore():
             for k, v in olds.items():
                 setattr(_r, k, v)
@@ -2456,16 +2467,22 @@ class TestProbeBeforeUse(unittest.TestCase):
 
     def test_disabled_by_default(self):
         import rotate as _r
-        self.assertEqual(_r.VERIFY_CMD, "",
-                         "默认必须关闭 —— 探测要消耗上游配额，不该由本项目替用户决定")
-        ok, note = _r.probe_ip("1.2.3.4")
+        # 默认值现在由 VERIFY_FILE 决定（代码里仍是空 = 不探测），
+        # 「开不开」是部署决定，不该硬编码在仓库里。
+        self.assertEqual(_r._verify_cmd(),
+                         (open(_r.VERIFY_FILE).read().strip()
+                          if os.path.exists(_r.VERIFY_FILE) else ""))
+        ok, note, limited = _r.probe_ip("1.2.3.4")
         self.assertTrue(ok, "关闭时不得探测，直接放行")
+        self.assertFalse(limited)
         self.assertEqual(note, "")
 
     def test_zero_exit_means_pass(self):
         import rotate as _r
         self._with(self._script("import sys" + chr(10) + "sys.exit(0)" + chr(10)))
-        ok, _ = _r.probe_ip("1.2.3.4")
+        ok, _, limited = _r.probe_ip("1.2.3.4")
+        self.assertTrue(ok)
+        self.assertFalse(limited, "通过时不该声称是限流")
         self.assertTrue(ok)
 
     def test_nonzero_exit_means_reject(self):
@@ -2474,28 +2491,124 @@ class TestProbeBeforeUse(unittest.TestCase):
                 + "print('429 rate limited')" + chr(10)
                 + "sys.exit(1)" + chr(10))
         self._with(self._script(body))
-        ok, note = _r.probe_ip("1.2.3.4")
+        ok, note, limited = _r.probe_ip("1.2.3.4")
         self.assertFalse(ok, "非零退出必须判为不通")
+        self.assertTrue(limited, "输出含 429 -> 必须标记为限流，调用方据此拉黑")
         self.assertIn("429", note, "理由要带出来，否则运维看不懂为什么丢弃")
 
     def test_timeout_is_rejection_not_crash(self):
         import rotate as _r
         body = "import time" + chr(10) + "time.sleep(30)" + chr(10)
         self._with(self._script(body), VERIFY_TIMEOUT=1)
-        ok, note = _r.probe_ip("1.2.3.4")
+        ok, note, limited = _r.probe_ip("1.2.3.4")
         self.assertFalse(ok)
         self.assertIn("超时", note)
+        self.assertFalse(limited,
+                         "超时不是限流 —— 拉黑会把好 IP 误伤 12h")
 
     def test_rejected_ip_is_never_accepted(self):
         """全部候选被拒时，绝不能把被拒的 IP 写进状态。"""
         r = (ROOT / "rotate.py").read_text(encoding="utf-8")
         i = r.index("while (new_ip in seen or")
         blk = r[i:r.index("def ", i)]
-        self.assertIn("if VERIFY_CMD and new_ip in rejected:", blk,
+        self.assertIn("if _vcmd and new_ip in rejected:", blk,
                       "缺守卫：探测全被拒时 new_ip 仍指向被拒 IP，会被当结果接受")
-        j = blk.index("if VERIFY_CMD and new_ip in rejected:")
+        j = blk.index("if _vcmd and new_ip in rejected:")
         self.assertIn("return False", blk[j:j + 600],
                       "守卫必须放弃本轮，而不是继续往下记账")
+
+
+
+class TestBlacklist(unittest.TestCase):
+    """黑名单：已被上游按来源封禁的出口 IP，12h 后自动失效。
+
+    实测 1/22 ≈ 4.5% 的 IP 是脏的，且**无法从 IP 字面看出脏不脏**。
+    12h 不重复的承诺在这里帮不上忙 —— 它保证「我们不重复用同一个 IP」，
+    而脏 IP 是**第一次遇到就已经脏了**（共享 NAT 出口被别人用坏）。
+    """
+
+    def test_empty_state_is_empty(self):
+        import rotate as _r
+        self.assertEqual(_r.prune_blacklist(None), [])
+        self.assertEqual(_r.prune_blacklist([]), [])
+
+    def test_add_is_idempotent(self):
+        import rotate as _r
+        st = {}
+        self.assertTrue(_r.blacklist_add(st, "1.2.3.4", "测试"))
+        self.assertFalse(_r.blacklist_add(st, "1.2.3.4", "测试"),
+                         "同一个 IP 不该重复占位")
+        self.assertEqual(len(st["blacklist"]), 1)
+
+    def test_expires_after_ttl(self):
+        import rotate as _r, time
+        st = {}
+        _r.blacklist_add(st, "1.2.3.4", "测试")
+        # 把时间戳推到 TTL 之外
+        st["blacklist"][0][0] = time.time() - (_r.BLACKLIST_TTL_H * 3600 + 60)
+        self.assertEqual(_r.prune_blacklist(st["blacklist"]), [],
+                         "超过 %dh 必须自动失效" % _r.BLACKLIST_TTL_H)
+
+    def test_kept_within_ttl(self):
+        import rotate as _r, time
+        st = {}
+        _r.blacklist_add(st, "1.2.3.4", "测试")
+        st["blacklist"][0][0] = time.time() - (_r.BLACKLIST_TTL_H * 3600 - 60)
+        self.assertEqual(len(_r.prune_blacklist(st["blacklist"])), 1)
+
+    def test_ttl_is_twelve_hours(self):
+        import rotate as _r
+        self.assertEqual(_r.BLACKLIST_TTL_H, 12,
+                         "用户明确要求 12 小时清空一次")
+
+    def test_only_rate_limit_signals_are_hints(self):
+        """超时不配拉黑 —— 否则一次抖动就把好 IP 误伤 12h。"""
+        import rotate as _r
+        self.assertTrue(any("429" in h for h in _r.BL_RATE_HINTS))
+        self.assertTrue(any("rate limit" in h for h in _r.BL_RATE_HINTS))
+        self.assertFalse(any("timeout" in h or "超时" in h
+                             for h in _r.BL_RATE_HINTS),
+                         "超时不是限流信号")
+
+    def test_rotate_merges_blacklist_into_seen(self):
+        """黑名单必须并入 seen —— 否则重摇会抽回同一个脏 IP。"""
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("seen = recent_ips(state)")
+        blk = r[i:i + 900]
+        self.assertIn("prune_blacklist", blk)
+        self.assertIn("seen.append", blk,
+                      "黑名单条目必须加进 seen，重摇才会避开")
+
+
+class TestReport429Hook(unittest.TestCase):
+    """--report-429：外部上报 429 -> 拉黑 + 立即轮换。"""
+
+    def test_flag_exists(self):
+        import rotate as _r
+        self.assertTrue(hasattr(_r, "ROTATE_LOCK"),
+                        "轮换锁：定时器与钩子可能同时触发")
+
+    def test_cli_flag_is_wired(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        self.assertIn("--report-429", src)
+        self.assertIn("args.report_429 is not None", src)
+
+    def test_blacklist_persisted_before_rotating(self):
+        """必须先落盘再轮换 —— 否则轮换失败就丢了拉黑记录。"""
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("if args.report_429 is not None:")
+        j = src.index("立即轮换", i)
+        seg = src[i:j]
+        self.assertIn("update_state", seg,
+                      "拉黑必须先落盘，否则下一次轮换又会抽回同一个脏 IP")
+        self.assertLess(seg.index("update_state"), seg.index("rotate_once")
+                        if "rotate_once" in seg else len(seg))
+
+    def test_report_hook_respects_lock(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("if args.report_429 is not None:")
+        seg = src[i:src.index("立即轮换", i)]
+        self.assertIn("fcntl.flock", seg, "钩子必须与定时器互斥")
 
 
 
