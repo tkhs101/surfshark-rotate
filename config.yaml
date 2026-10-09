@@ -1,13 +1,17 @@
 # ==============================================================
-#  Surfshark 亚洲节点 — mihomo 配置（Linux / VPS 版）
+#  Surfshark 节点池 — mihomo 配置（Linux / VPS 版）
 #
-#  整机分流：只有 opencode.ai 与 ip.sb 走代理并每 5 分钟换一次出口 IP，
+#  40 个节点：从账号可用的 138 个机位里，按**生产实例实测**延迟挑出中位 <200ms 的
+#  那一批（每节点 10 次采样取中位数）。实测中位 108ms、最快 jp-tok 10ms、最慢 us-oma 197ms。
+#  筛选依据与踩过的坑见 rotate.py 里 NODES 上方的注释。
+#
+#  整机分流：只有 opencode.ai 与 ip.sb 走代理并每 10 分钟换一次出口 IP，
 #  其余全部直连。与 Windows 版分流规则一致。
 #
 #  下方 secret、route-exclude-address、WG_PRIVATE_KEY 三处占位符由 install.sh 填充，
 #  本文件不可直接使用。
 #
-#  【私钥不进版本库】private-key 是你 Surfshark 账号的真实私钥，4 个节点共用同一个。
+#  【私钥不进版本库】private-key 是你 Surfshark 账号的真实私钥，**全部 40 个节点共用同一个**。
 #  它由 install.sh 从 surfshark.key 文件或 SURFSHARK_WG_KEY 环境变量注入，
 #  surfshark.key 已列入 .gitignore。public-key 是公钥，公开无妨。
 # ==============================================================
@@ -41,16 +45,22 @@ tun:
   # MTU 由 install.sh 按本机实际网卡 MTU 推算填入：网卡 MTU − 60（WireGuard 开销）。
   # 写死是错的 —— 各云厂商网卡 MTU 不同（1500/1460/1400 都有），
   # 照抄别处的值会导致外层包超网卡 MTU 而分片，或直接黑洞。
-  # 注意：占位符不能加引号。写成 "@@MTU@@" 的话，替换后会变成字符串 "1400"，
+  # 注意：占位符不能加引号。写成 "1400" 的话，替换后会变成字符串 "1400"，
   # 而 mihomo 要求 uint32，直接报 cannot unmarshal !!str into uint32。
   # 与下面 proxy 的 mtu 必须同值。
-  mtu: @@MTU@@
+  mtu: 1400
   # 【保 SSH 的关键】把 VPS 自身地址排除在 TUN 之外。
   # 这样 SSH 流量根本不进 mihomo —— 即使内核进程崩了，SSH 也不会被劫持。
   # install.sh 会填入：本机全部 IPv4、默认路由源地址、公网出口 IP、
   # 以及几家云厂商的元数据地址（避免 TUN 劫持 169.254.169.254 拿不到凭据）。
   route-exclude-address:
-@@ROUTE_EXCLUDE@@
+    # SSH 客户端对端（本机额外加固：SSH 流量根本不进 mihomo，不依赖规则顺序）
+    - 153.246.149.117/32
+    - 10.146.0.20/32
+    - 34.146.102.187/32
+    - 169.254.0.0/16
+    - 100.100.100.200/32
+    - 192.0.0.192/32
 
 dns:
   enable: true
@@ -137,9 +147,9 @@ proxies:
     server: jp-tok.prod.surfshark.com
     port: 51820
     ip: 10.14.0.2
-    private-key: "@@WG_PRIVATE_KEY@@"
+    private-key: @@WG_PRIVATE_KEY@@
     public-key: "YJSjrc/WWOjQUyUi4iYcHb7LsWWoCY+2fK8/8VtC/BY="
-    mtu: @@MTU@@
+    mtu: 1400
     udp: true
 
   - name: "KR 韩国-首尔"
@@ -147,9 +157,9 @@ proxies:
     server: kr-seo.prod.surfshark.com
     port: 51820
     ip: 10.14.0.2
-    private-key: "@@WG_PRIVATE_KEY@@"
+    private-key: @@WG_PRIVATE_KEY@@
     public-key: "bD/m2mdKxJXG2wTkLsmWpiW8xZwkDdrrrwC44auOhQg="
-    mtu: @@MTU@@
+    mtu: 1400
     udp: true
 
   - name: "SG 新加坡"
@@ -157,9 +167,9 @@ proxies:
     server: sg-sng.prod.surfshark.com
     port: 51820
     ip: 10.14.0.2
-    private-key: "@@WG_PRIVATE_KEY@@"
+    private-key: @@WG_PRIVATE_KEY@@
     public-key: "MGfgkhJsMVMTO33h1wr76+z6gQr/93VcGdClfbaPsnU="
-    mtu: @@MTU@@
+    mtu: 1400
     udp: true
 
   - name: "TW 台湾-台北"
@@ -167,17 +177,344 @@ proxies:
     server: tw-tai.prod.surfshark.com
     port: 51820
     ip: 10.14.0.2
-    private-key: "@@WG_PRIVATE_KEY@@"
+    private-key: @@WG_PRIVATE_KEY@@
     public-key: "P0vaGUOUE7V5bbGOYY2WgQeZnTZEHvIr+dfebU7W4Ao="
-    mtu: @@MTU@@
+    mtu: 1400
     udp: true
 
 # --------------------------------------------------------------
 #  策略组
 #   FAST     — 只含日韩（实测延迟最低的两档），url-test 自动挑快的
 #   PROXY    — 轮换脚本操作的组，成员顺序即优先级
-#   AUTOFALL — 降级链：PROXY 整个不健康时退到 DIRECT（由 rotate.py 显式切换，不是内核自动翻；恢复同样由 rotate.py 切回）
+#   AUTOFALL — **select** 组（PROXY / DIRECT），由 rotate.py 显式切换。
+#                内核不会自己切回来 —— 这是刻意的，理由见 ADR 0001。
 # --------------------------------------------------------------
+  - name: "KH 柬埔寨-金边"
+    type: wireguard
+    server: kh-pnh.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "z2Ik8BG6XgosyYE/O4Vz4kiPTZyoWSlJvZtFeFlNclI="
+    mtu: 1400
+    udp: true
+  - name: "HK 香港"
+    type: wireguard
+    server: hk-hkg.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "JYHdktdtuM7inbtsxRKSDpnBVTWQ5+QLZ/cWWmf4VRg="
+    mtu: 1400
+    udp: true
+  - name: "PH 菲律宾-马尼拉"
+    type: wireguard
+    server: ph-mnl.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "utXZy1ELBSQKa6s9/K/W4sV11Jod6sSLoikKqKRPyQs="
+    mtu: 1400
+    udp: true
+  - name: "VN 越南-胡志明"
+    type: wireguard
+    server: vn-hcm.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "Mioou38fh5H+3LWMpitLOWT3JaDGg2gXxqjl2eXkPFU="
+    mtu: 1400
+    udp: true
+
+  - name: "BN 文莱"
+    type: wireguard
+    server: bn-bwn.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "QE7hpHqVYWqohTmOnmYtKjUv4b6Bb8S2b9AF0EFl638="
+    mtu: 1400
+    udp: true
+  - name: "MN 蒙古-乌兰巴托"
+    type: wireguard
+    server: mn-uln.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "3nLHy4uBd2nBUDuAuR6AM58yHLiX2CAXg8kdgEr6tV4="
+    mtu: 1400
+    udp: true
+  - name: "LA 老挝-万象"
+    type: wireguard
+    server: la-vte.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "yIlpSftvkSE2+T0uqxWl9HeQSrmPg+HkyvGLi55UqG0="
+    mtu: 1400
+    udp: true
+  - name: "MO 澳门"
+    type: wireguard
+    server: mo-mfm.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "uMD8IFggqtF0ZbviJJFMQFhR3R52mVqhoJmKPt+aACs="
+    mtu: 1400
+    udp: true
+  - name: "NP 尼泊尔-加德满都"
+    type: wireguard
+    server: np-ktm.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "UKMTmY99xrUwchQNucd1SW6CmIFsDH1JpxQStRWA1V4="
+    mtu: 1400
+    udp: true
+  - name: "BD 孟加拉-达卡"
+    type: wireguard
+    server: bd-dac.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "6tOduT4iNbZyqKNzsSgDe/ckziO6101NPZwrnY5WpTk="
+    mtu: 1400
+    udp: true
+  - name: "MM 缅甸-仰光"
+    type: wireguard
+    server: mm-nyt.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "tehGZzcmdK59x99I9dbfuWOHSxBdPsz5lB+uAoT75kE="
+    mtu: 1400
+    udp: true
+  - name: "MY 马来西亚-吉隆坡"
+    type: wireguard
+    server: my-kul.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "AS84LXlJfgBwGHc70MvtGRxsMqNNucZ2pNOBayJUm04="
+    mtu: 1400
+    udp: true
+  - name: "LK 斯里兰卡-科伦坡"
+    type: wireguard
+    server: lk-cmb.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "+8TxSpyyEGiZK6d/5V+94Zc7nxOV3F1ag7sM6AN86GY="
+    mtu: 1400
+    udp: true
+  - name: "PK 巴基斯坦-卡拉奇"
+    type: wireguard
+    server: pk-khi.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "DLb7wUFYkOcx5iiNxbNquP5rH+EJdiQfrdFaQoojskU="
+    mtu: 1400
+    udp: true
+
+  - name: "US US-LAS-拉斯维加斯"
+    type: wireguard
+    server: us-las.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "Nw5CG5BOvqb8GXVEKLOo7v3gGvP7WaUYlJT++c3c31g="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-西雅图"
+    type: wireguard
+    server: us-sea.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "SpMH/p90bg9ZAG6V2DWJQ9csWPVnKcDVppIp9Xul5G8="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-洛杉矶"
+    type: wireguard
+    server: us-lax.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "m+L7BVQWDwU2TxjfspMRLkRctvmo7fOkd+eVk6KC5lM="
+    mtu: 1400
+    udp: true
+  - name: "AU 澳大利亚-悉尼"
+    type: wireguard
+    server: au-syd.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "Y5KM9kHdM0upMsIJWUQquOY1RgkWX69AHw/Dl5KyIk4="
+    mtu: 1400
+    udp: true
+  - name: "ID 印尼-雅加达"
+    type: wireguard
+    server: id-jak.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "qyghLDfpfyparp0M52OVcmhKckayOvbRO2DDLkgJqyk="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-圣何塞"
+    type: wireguard
+    server: us-sjc.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "sDDS1f/+IqVljMN7GzMFeAbNescQUTLIt0xio0W61Q0="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-巴顿鲁日"
+    type: wireguard
+    server: us-bdn.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "YaxEFQHtwF/EGvf5s/aLlX5Jr0djKTV5oNcAcIwAz0E="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-丹佛"
+    type: wireguard
+    server: us-den.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "AnRLZKBwCfuGFZfoa3dsdjpcpvgFsQhASmjHXhIJLgM="
+    mtu: 1400
+    udp: true
+  - name: "TH 泰国-曼谷"
+    type: wireguard
+    server: th-bkk.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "OoFY46j/w4uQFyFu/OQ/h3x+ymJ1DJ4UR1fwGNxOxk0="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-亚特兰大"
+    type: wireguard
+    server: us-atl.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "SgciXll6wGQhcyxPUdp0V0z6WwN9P3fqDoeh3N3xNjc="
+    mtu: 1400
+    udp: true
+  - name: "CA 加拿大-温哥华"
+    type: wireguard
+    server: ca-van.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "o4HezxSsbNqJFJZj+VBw/QXFLpfNo7PZu8xe7H2hTw0="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-凤凰城"
+    type: wireguard
+    server: us-phx.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "HDCyeD2+lw6KHVMu7Opkt4V4ikYZHzQNWmwklBMb4Ac="
+    mtu: 1400
+    udp: true
+  - name: "BZ 伯利兹"
+    type: wireguard
+    server: bz-blp.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "zcxA9gW+ism40rUoF5B4UPV655FLymJ1n4t0WogtZkU="
+    mtu: 1400
+    udp: true
+  - name: "US US-LTM-拉斯维加斯"
+    type: wireguard
+    server: us-ltm.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "Smruh1SmMqi7CecjV/+yI4Sy62gpAr+Uddq+9K6iLB0="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-迈阿密"
+    type: wireguard
+    server: us-mia.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "KvJ/jtWb8BsBI85OcZnOIJu9kfh12mCMR4cejWFpDCc="
+    mtu: 1400
+    udp: true
+  - name: "BS 巴哈马-拿骚"
+    type: wireguard
+    server: bs-nas.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "uM3cUZiQ46nRLALqOQfBz2cqg+RyR/OIHH0Xvwf9wHY="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-旧金山"
+    type: wireguard
+    server: us-sfo.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "7SpGSSI78hf8jy689ec5Ql0/Gsq0LLHDmjEFsGUWl1k="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-纽约"
+    type: wireguard
+    server: us-nyc.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "rhuoCmHdyYrh0zW3J0YXZK4aN3It7DD26TXlACuWnwU="
+    mtu: 1400
+    udp: true
+  - name: "MX 墨西哥-克雷塔罗"
+    type: wireguard
+    server: mx-qro.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "6C8O3L/Li0JOO5aWvL6PrciiZOOaRBtWmempOUENLQs="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-奥马哈"
+    type: wireguard
+    server: us-oma.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "7Z8FJEl+BtQuAyNuUWIZxHGrQP7rumhFlIq4azHvCgs="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-达拉斯"
+    type: wireguard
+    server: us-dal.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "0iwHQpV+rsOg38ogv4g4XMLJa51YqWY/yKWR9UEUMDk="
+    mtu: 1400
+    udp: true
+  - name: "US 美国-盐湖城"
+    type: wireguard
+    server: us-slc.prod.surfshark.com
+    port: 51820
+    ip: 10.14.0.2
+    private-key: @@WG_PRIVATE_KEY@@
+    public-key: "jxotWPy1jNzKzjqSqg6KkWnoOsp/FbrTK4+j9gluSFA="
+    mtu: 1400
+    udp: true
 proxy-groups:
   - name: "FAST"
     type: url-test
@@ -195,10 +532,47 @@ proxy-groups:
       - "KR 韩国-首尔"
       - "SG 新加坡"
       - "TW 台湾-台北"
+      - "KH 柬埔寨-金边"
+      - "HK 香港"
+      - "PH 菲律宾-马尼拉"
+      - "VN 越南-胡志明"
+      - "BN 文莱"
+      - "MN 蒙古-乌兰巴托"
+      - "LA 老挝-万象"
+      - "MO 澳门"
+      - "NP 尼泊尔-加德满都"
+      - "BD 孟加拉-达卡"
+      - "MM 缅甸-仰光"
+      - "MY 马来西亚-吉隆坡"
+      - "LK 斯里兰卡-科伦坡"
+      - "PK 巴基斯坦-卡拉奇"
+      - "US US-LAS-拉斯维加斯"
+      - "US 美国-西雅图"
+      - "US 美国-洛杉矶"
+      - "AU 澳大利亚-悉尼"
+      - "ID 印尼-雅加达"
+      - "US 美国-圣何塞"
+      - "US 美国-巴顿鲁日"
+      - "US 美国-丹佛"
+      - "TH 泰国-曼谷"
+      - "US 美国-亚特兰大"
+      - "CA 加拿大-温哥华"
+      - "US 美国-凤凰城"
+      - "BZ 伯利兹"
+      - "US US-LTM-拉斯维加斯"
+      - "US 美国-迈阿密"
+      - "BS 巴哈马-拿骚"
+      - "US 美国-旧金山"
+      - "US 美国-纽约"
+      - "MX 墨西哥-克雷塔罗"
+      - "US 美国-奥马哈"
+      - "US 美国-达拉斯"
+      - "US 美国-盐湖城"
       - "FAST"
 
   # --------------------------------------------------------------
-  #  降级链：节点全挂时退到直连（rotate.py 显式切换），节点恢复后由 rotate.py 切回
+  #  降级链：节点全挂时由 rotate.py 显式退到 DIRECT（AUTOFALL 是 select 组，
+#  内核不自动切回）；节点恢复后同样由 rotate.py 显式切回 PROXY。
   #
   #  【为什么必须有】WireGuard 私钥到期或节点全挂时，PROXY 是 select 组，
   #  mihomo 不会自动回退 —— opencode.ai 与 ip.sb 会直接连不上：
@@ -206,42 +580,45 @@ proxy-groups:
   #  也就是说密钥一过期，本项目唯一的产出（IP 轮换）就整体停摆，
   #  而除了翻 journal 没有别的信号能发现。
   #
-  #  AUTOFALL 是 **select** 组而不是 fallback 组 —— 这个选择是刻意的，
-  #  也是本次修复的核心：降级与恢复完全由 rotate.py 通过
-  #  PUT /proxies/AUTOFALL 显式切换，内核不参与判断。
+  #  AUTOFALL 是 fallback 组，成员顺序即优先级，取第一个健康的：
+  #  PROXY 健康时永远选它，只有整个 PROXY 组都不健康才落到 DIRECT。
   #  PROXY 组本身不动，rotate.py 照旧操作它。
   #
-  #  【为什么不能用 fallback】实测（真实内核 v1.19.32）：
-  #    · fallback 的判定是**单样本布尔查表**。fallback.go 的 findAliveProxy()
-  #      顺序遍历成员、返回第一个 AliveForTestUrl()==true 的，Now() 直接调它，
-  #      中间没有任何计数器、迟滞或冷却 —— 隧道抖一下，下一条连接立刻走直连。
+  #  实测（真实内核 v1.19.32）：
+  #    节点全死    → AUTOFALL 选中 DIRECT，请求正常发出
+  #    节点恢复后  → 下一轮健康检查自动切回 PROXY，无需人工干预
+  #
+  #  lazy: false 是刻意的。默认 lazy: true 会在每条连接路由时触发健康检查，
+  #  而每轮轮换都要热重载重建隧道 —— 实测重建只要 0.2~0.7 秒，
+  #  远小于下面的 interval，所以定周期检查几乎撞不上重建窗口
+  #  （3 轮真实轮换、每轮 26 秒采样 126 次，零误降级）。
+  #  但 lazy 会让每个恰好落在重建窗口里的新连接都被判成节点已死而送去直连。
+  #
+  #  timeout 从默认的 5000 提到 15000 —— 这是降低误降级率**唯一**真正有效的杠杆。
+  #  【必须知道的机制边界】mihomo 的 fallback 判定是单样本布尔查表：
+  #  fallback.go 的 findAliveProxy() 顺序遍历成员、返回第一个
+  #  AliveForTestUrl()==true 的，Now() 直接调它，中间没有任何计数器、迟滞或冷却。
   #    · max-failed-times 名字像，但只作用于 onDialFailed（拨号失败路径），
   #      周期健康检查根本不走它 —— 照抄会得到「以为防住了其实没防住」
   #    · fixed 钉选成员同样压不住，存活检查照样覆盖它
-  #    · relay 组已移除；fallback-filter 是 DNS 字段，不是代理组
-  #  结论：没有任何配置开关能给 fallback 加去抖，而单样本在原理上也无法
-  #  区分「瞬时抖动」和「真死」。所以调 timeout / interval 只能降低误判率，
-  #  永远降不到零。
-  #
-  #  【实测代价】17 小时内 AUTOFALL 翻到 DIRECT 共 5 次（其中 3 次来自我自己的
-  #  破坏密钥测试与密集压测），真实发生 1 次：01:20:25 有两条 opencode.ai 的
-  #  连接以 AUTOFALL[DIRECT] 发出，即用本机 GCP 机房 IP 出网。那一刻没有任何
-  #  轮换在跑，是纯粹的共享路径抖动。对本项目而言泄漏比失败更糟 —— 失败只是
-  #  断一次，泄漏是把机房 IP 送到对方面前，而暴露机房 IP 恰恰是这个项目
-  #  要避免的事。改成 select 之后，这 5 次翻转一次都不会再发生。
-  #
-  #  【降级与恢复】
-  #    降级：rotate.py 连续 2 轮取不到出口 IP 才切到 DIRECT
-  #          （DEGRADE_AFTER_FAILS，约 10 分钟），要求故障持续至少
-  #          一个完整轮换周期 —— 私钥到期会持续数天必然满足，瞬时抖动不会。
-  #    恢复：判据走控制面（节点 delay 探测），完全不经过 AUTOFALL 与数据面。
-  #          用 AUTOFALL 自己的状态判断恢复会自证循环。
-  #          换私钥必然要 restart mihomo，on-mihomo-up.sh 在那里负责恢复。
+  #    · relay 组已被移除；fallback-filter 是 DNS 字段，不是代理组
+  #  结论：没有任何配置开关能给 fallback 加去抖。单样本在原理上无法区分
+  #  「瞬时抖动」和「真死」，只能调阈值让抖动不够大 —— 这就是 timeout 的作用。
+  #  代价是真故障发现延迟从 interval+5 变成 interval+15 秒，
+  #  相对「持续数天」的密钥过期可以忽略。
+  #  AUTOFALL 是 **select** 组而不是 fallback —— 降级与恢复完全由 rotate.py
+  #  通过 PUT /proxies/AUTOFALL 显式切换，内核不参与判断。
+  #  fallback 的判定是单样本布尔查表（findAliveProxy 无计数、无迟滞），
+  #  隧道抖一下就会翻 DIRECT；实测 17 小时内翻过 5 次，其中 1 次让 opencode.ai
+  #  用本机 GCP 机房 IP 出网。select 没有健康检查，永不自行翻转。
+  #  降级只在连续 2 轮取不到出口 IP 时触发；恢复判据走控制面节点探测，
+  #  不经过 AUTOFALL 与数据面。完整说明见仓库 config.yaml。
   - name: "AUTOFALL"
     type: select
     proxies:
       - "PROXY"
       - "DIRECT"
+
 
 # --------------------------------------------------------------
 #  分流
