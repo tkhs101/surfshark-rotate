@@ -2420,5 +2420,84 @@ class TestWatchdogPatternsAreNotDead(unittest.TestCase):
                             "条件恒假、默认分支每次触发" % frag)
 
 
+class TestProbeBeforeUse(unittest.TestCase):
+    """「先测再用」：换到候选 IP 后先探测，不过就丢弃。
+
+    实测池里约 4.5% 的 IP 已被上游按来源封禁（共享 NAT 出口被别人用坏），
+    样本 82.26.195.42 —— 同一时刻 7 个 IP 通过、只有它 429，
+    且几分钟后用完全相同的方式独立复现。
+    而 IP 字面上看不出脏不脏，所以只能探测。
+    """
+
+    def _script(self, code):
+        """写一个**跨平台**的探测命令。
+
+        早先用 `#!/bin/sh` 的 unix 脚本 —— 在 Windows 上跑不了，
+        `subprocess.run(shell=True)` 返回 0（找不到命令却当成功），
+        于是 `test_nonzero_exit_means_reject` **假绿**。
+        这正是「看起来测过了」的一例：它绿着，而被测的东西根本没跑。
+        """
+        import tempfile, os, sys
+        f = tempfile.NamedTemporaryFile("w", suffix=".py", delete=False)
+        f.write(code)
+        f.close()
+        return "%s %s" % (sys.executable, f.name)
+
+    def _with(self, cmd, **kw):
+        import rotate as _r
+        olds = {k: getattr(_r, k) for k in ("VERIFY_CMD", "VERIFY_TIMEOUT")}
+        setattr(_r, "VERIFY_CMD", cmd)
+        for k, v in kw.items():
+            setattr(_r, k, v)
+        def restore():
+            for k, v in olds.items():
+                setattr(_r, k, v)
+        self.addCleanup(restore)
+
+    def test_disabled_by_default(self):
+        import rotate as _r
+        self.assertEqual(_r.VERIFY_CMD, "",
+                         "默认必须关闭 —— 探测要消耗上游配额，不该由本项目替用户决定")
+        ok, note = _r.probe_ip("1.2.3.4")
+        self.assertTrue(ok, "关闭时不得探测，直接放行")
+        self.assertEqual(note, "")
+
+    def test_zero_exit_means_pass(self):
+        import rotate as _r
+        self._with(self._script("import sys" + chr(10) + "sys.exit(0)" + chr(10)))
+        ok, _ = _r.probe_ip("1.2.3.4")
+        self.assertTrue(ok)
+
+    def test_nonzero_exit_means_reject(self):
+        import rotate as _r
+        body = ("import sys" + chr(10)
+                + "print('429 rate limited')" + chr(10)
+                + "sys.exit(1)" + chr(10))
+        self._with(self._script(body))
+        ok, note = _r.probe_ip("1.2.3.4")
+        self.assertFalse(ok, "非零退出必须判为不通")
+        self.assertIn("429", note, "理由要带出来，否则运维看不懂为什么丢弃")
+
+    def test_timeout_is_rejection_not_crash(self):
+        import rotate as _r
+        body = "import time" + chr(10) + "time.sleep(30)" + chr(10)
+        self._with(self._script(body), VERIFY_TIMEOUT=1)
+        ok, note = _r.probe_ip("1.2.3.4")
+        self.assertFalse(ok)
+        self.assertIn("超时", note)
+
+    def test_rejected_ip_is_never_accepted(self):
+        """全部候选被拒时，绝不能把被拒的 IP 写进状态。"""
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("while (new_ip in seen or")
+        blk = r[i:r.index("def ", i)]
+        self.assertIn("if VERIFY_CMD and new_ip in rejected:", blk,
+                      "缺守卫：探测全被拒时 new_ip 仍指向被拒 IP，会被当结果接受")
+        j = blk.index("if VERIFY_CMD and new_ip in rejected:")
+        self.assertIn("return False", blk[j:j + 600],
+                      "守卫必须放弃本轮，而不是继续往下记账")
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

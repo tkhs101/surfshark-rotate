@@ -81,7 +81,45 @@ SAME_IP_WARN = 3            # 连续 3 轮出口 IP 不变 -> 产出为零，开
 # 旧实现没有这个概念，所以「重现」只会发生、不会被发现。
 RECENT_WINDOW_H = 12
 ROUND_INTERVAL_MIN = 10      # 定时器间隔；改它之前先看 --status 的「12h 验证」那一段
-MAX_REDRAW = 8              # 撞到窗口内用过的地址时，最多重摇几次（每次约 6 秒）
+MAX_REDRAW = 8
+# 「先测再用」：换到候选 IP 后先探测，通过才认。
+# 实测池子里约 4.5% 的 IP 已被上游按来源封禁（共享 NAT 出口被别人用坏），
+# 典型样本：82.26.195.42 —— 同一时刻 7 个 IP 通过、只有它 429，
+# 且几分钟后用完全相同的方式独立复现。
+#
+# 空字符串 = 关闭（保持原行为）。打开它需要外部命令，本项目不内置任何具体实现，
+# 避免把「探测哪个上游、怎么算通过」硬编码进来。
+VERIFY_CMD = ""
+VERIFY_TIMEOUT = 60
+# 探测最多试几个候选。每个约 2-7 秒、2 个上游请求；
+# 池内脏 IP 约 4.5%，所以期望尝试次数约 1.05，设 4 足够。
+VERIFY_MAX_TRY = 4              # 撞到窗口内用过的地址时，最多重摇几次（每次约 6 秒）
+
+
+def probe_ip(ip):
+    """探测当前出口 IP 能否正常访问上游。
+
+    返回 (ok: bool, note: str)。VERIFY_CMD 为空时**不做任何探测**，
+    直接返回 True —— 这样默认行为与改动前完全一致。
+
+    刻意不内置任何具体探测命令：探测哪个上游、算不算通过，
+    是部署环境的事。本函数只负责「跑一下、看退出码」。
+    """
+    if not VERIFY_CMD:
+        return True, ""
+    try:
+        r = subprocess.run(
+            VERIFY_CMD, shell=True, timeout=VERIFY_TIMEOUT,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    except subprocess.TimeoutExpired:
+        return False, "探测超时"
+    except Exception as e:
+        return False, f"探测异常 {type(e).__name__}"
+    if r.returncode == 0:
+        return True, ""
+    out = (r.stdout or b"").decode("utf-8", "replace").strip()
+    tail = " / ".join(l.strip() for l in out.splitlines() if l.strip())[-160:]
+    return False, tail or f"退出码 {r.returncode}"
 
 
 def prune_recent(entries, now=None):
@@ -1300,7 +1338,7 @@ def rotate_once(dry_run=False):
     # 原地重摇实测接受率 0/9，绕圈重摇只是把同一个 0/9 做了两遍。
     # 现在显式记录本轮已试过的节点，试完一圈就停。
     tried = {live, target}
-    while new_ip in seen and redraws < MAX_REDRAW:
+    while (new_ip in seen or (VERIFY_CMD and new_ip in rejected)) and redraws < MAX_REDRAW:
         nxt = next((n for n in NODES
                     if n not in tried), None)
         if nxt is None:
@@ -1319,6 +1357,23 @@ def rotate_once(dry_run=False):
         if not new_ip:
             log("    重摇后取不到出口 IP，保留本轮结果")
             break
+        if VERIFY_CMD:
+            vok, note = probe_ip(new_ip)
+            if not vok:
+                rejected.append(new_ip)
+                log(f"    探测未通过：{new_ip} —— 丢弃，换一个（{note}）")
+                if redraws >= VERIFY_MAX_TRY:
+                    log(f"    已试 {redraws} 个候选仍全被拒 —— "
+                        f"本轮**不认**新 IP，保持当前节点")
+                    break
+                continue
+
+    # 【守卫】探测全被拒时 new_ip 仍指向最后一个被拒的 IP —— 不能当结果接受。
+    # 此时本轮应当「什么都不做」，而不是把一个已证不通的 IP 写进状态。
+    if VERIFY_CMD and new_ip in rejected:
+        log(f"    本轮放弃：候选 {new_ip} 探测未通过，**不认**它")
+        log(f"    保持节点 {target}，出口 IP 维持上一轮的 {old_ip or '(未知)'}")
+        return False
 
     if new_ip and new_ip in seen:
         # 重摇次数用尽仍未避开 —— 这时**说出来**，不要假装达标。
