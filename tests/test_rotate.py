@@ -1455,9 +1455,11 @@ class TestRotationStrategy(unittest.TestCase):
         import rotate as _r
         self.r = _r
 
-    def test_all_four_nodes_are_in_rotation(self):
-        self.assertEqual(len(self.r.NODES), 4, "SG/TW 必须在轮询里，否则一次也用不上")
-        for n in ("JP", "KR", "SG", "TW"):
+    def test_all_nodes_are_in_rotation(self):
+        self.assertGreaterEqual(
+            len(self.r.NODES), 4,
+            "节点数不能少于 4（原四节点是下限，扩充只会更多）")
+        for n in ("JP", "KR", "SG", "TW", "KH", "HK", "PH", "VN"):
             self.assertTrue(any(x.startswith(n) for x in self.r.NODES),
                             "%s 不在 NODES 里" % n)
 
@@ -1470,9 +1472,9 @@ class TestRotationStrategy(unittest.TestCase):
             seen.append(n)
             st["idx"] += 1
             st["node_at"] = (self.r.NODES.index(n) + 1) % len(self.r.NODES)
-        self.assertEqual(len(set(seen[:4])), 4, "一个完整周期必须经过四个节点")
-        self.assertEqual(seen[:4], seen[4:], "第二个周期应完全重复")
-
+        n_all = len(self.r.NODES)
+        self.assertEqual(len(set(seen[:n_all])), n_all, "一个完整周期必须经过全部节点")
+        self.assertEqual(seen[:n_all], seen[n_all:], "第二个周期应完全重复")
     def test_skip_moves_to_a_different_pool(self):
         """重摇**必须换节点** —— 原地重摇实测接受率 0/9。"""
         st = {"idx": 0, "node_at": 0}
@@ -1949,19 +1951,31 @@ class TestRedrawVisitsEachNodeOnce(unittest.TestCase):
     「换一个池子抽」在绕圈后失效，等于把「原地重摇 0/9」做了两遍。
     """
 
-    def test_skip_would_wrap_around(self):
+    def test_redraw_cannot_exhaust_all_nodes(self):
+        """MAX_REDRAW 必须 >= 节点数，否则重摇还没绕完一圈就停了。
+
+        注意方向：**跳过 skip 绕圈**是好事（8 节点时 MAX_REDRAW=8 已不绕圈），
+        但重摇本身仍受 MAX_REDRAW 限制，所以它不能小于节点数。
+        """
         import rotate as _r
-        self.assertGreater(_r.MAX_REDRAW, len(_r.NODES),
-                           "若 MAX_REDRAW <= 节点数，skip 不会绕圈，这条测试的前提消失")
+        self.assertGreaterEqual(_r.MAX_REDRAW, len(_r.NODES),
+                                "MAX_REDRAW=%d < 节点数=%d -> 重摇试不完一圈就停"
+                                % (_r.MAX_REDRAW, len(_r.NODES)))
 
     def test_skip_returns_already_tried_nodes(self):
         """证明 skip 确实会绕圈 —— 这是修它的理由，不是假设。"""
         import rotate as _r
         st = {"idx": 0}
         seq = [_r.pick_next(st, skip=k) for k in range(_r.MAX_REDRAW)]
-        self.assertLess(len(set(seq)), len(seq),
-                        "skip 已经不绕圈了？（MAX_REDRAW=%d, 节点数=%d）"
-                        % (_r.MAX_REDRAW, len(_r.NODES)))
+        want_wrap = _r.MAX_REDRAW > len(_r.NODES)
+        if want_wrap:
+            self.assertLess(len(set(seq)), len(seq),
+                            "MAX_REDRAW=%d > 节点数=%d 时 skip 必须绕圈"
+                            % (_r.MAX_REDRAW, len(_r.NODES)))
+        else:
+            # 重摇现在靠 `tried` 集合防重复，不再依赖 skip 绕圈，
+            # 所以「不绕圈」是**正确**状态，不是回归。
+            self.assertEqual(len(set(seq)), len(_r.NODES))
 
     def test_rotate_source_tracks_tried_nodes(self):
         src = (ROOT / "rotate.py").read_text(encoding="utf-8")
@@ -2306,20 +2320,22 @@ class TestIdxAndNodeAtAreSeparate(unittest.TestCase):
             n = _r.pick_next(st)
             st["idx"] = st["idx"] + 1
             st["node_at"] = (_r.NODES.index(n) + 1) % len(_r.NODES)
+        n = len(_r.NODES)
         self.assertEqual(st["idx"], 7, "idx 必须只数轮次，不受落点影响")
-        self.assertEqual(st["node_at"], 3, "node_at 才是位置")
+        self.assertEqual(st["node_at"], 7 % n, "node_at 才是位置")
 
     def test_round_robin_is_strict(self):
         import rotate as _r
         st = {"idx": 0, "node_at": 0}
         seq = []
-        for _ in range(8):
+        for _ in range(2 * len(_r.NODES)):
             n = _r.pick_next(st)
             seq.append(n)
             st["idx"] += 1
             st["node_at"] = (_r.NODES.index(n) + 1) % len(_r.NODES)
-        self.assertEqual(seq[:4], seq[4:], "四个节点必须严格循环")
-        self.assertEqual(len(set(seq[:4])), 4)
+        k = len(_r.NODES)
+        self.assertEqual(seq[:k], seq[k:], "全部节点必须严格循环")
+        self.assertEqual(len(set(seq[:k])), k)
 
     def test_redraw_does_not_corrupt_idx(self):
         """重摇把落点带偏时，idx 仍必须只加一。"""
@@ -2329,7 +2345,7 @@ class TestIdxAndNodeAtAreSeparate(unittest.TestCase):
         st["idx"] += 1
         st["node_at"] = (_r.NODES.index(landed) + 1) % len(_r.NODES)
         self.assertEqual(st["idx"], 6, "重摇不应让 idx 跳变")
-        self.assertEqual(_r.pick_next(st), _r.NODES[2],
+        self.assertEqual(_r.pick_next(st), _r.NODES[2 % len(_r.NODES)],
                          "下一轮必须从落点之后继续，不能又落在同一个节点")
 
     def test_pick_next_does_not_read_idx(self):
