@@ -2350,5 +2350,75 @@ class TestIdxAndNodeAtAreSeparate(unittest.TestCase):
                       "「已换过 N 轮」必须来自 idx")
 
 
+class TestWatchdogPatternsAreNotDead(unittest.TestCase):
+    """watchdog 的每条模式都必须在 `--status` 的输出里**真实存在**。
+
+    这与 `TestAlertLinesAllHaveAWatchdogPattern` 是**反方向**的，
+    而且缺了它就留下一个真实的盲区：
+
+    上一轮我把 `--status` 的「12h 预算」行并进了「轮换产出」，
+    而 watchdog 仍在 grep「12h 预算」。于是那条 `|| reasons+=(...)`
+    **在健康状态下也恒为真**，把「判据来源失效」当成常态报出来。
+
+    正向矩阵抓不到它 —— 正向只扫「带告警前缀的行」，而那一行
+    已经被删除了。**矩阵扫不到被删除的东西。**
+    """
+
+    def _status_literals(self):
+        r = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = r.index("def show_status")
+        blk = r[i:r.index(chr(10) + "def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        import re
+        return re.findall(r"""log\(\s*f?["']([^"']+)""", code)
+
+    def _patterns(self):
+        import re
+        wd = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        code = chr(10).join(l for l in wd.split(chr(10))
+                            if not l.strip().startswith("#"))
+        return re.findall(r"""grep -qE? ['"]([^'"]+)['"]""", code)
+
+    def test_every_pattern_corresponds_to_a_real_output_line(self):
+        import re
+        """模式里的中文片段必须在 --status 的输出模板里出现过。"""
+        lits = self._status_literals()
+        dead = []
+        for pat in self._patterns():
+            frag = max(re.findall(r"[一-鿿][一-鿿 A-Za-z0-9：:/]{3,}", pat)
+                       or [pat[:6]], key=len)
+            frag = re.split(r"[：:]|——|\s\d", frag)[0].strip()
+            if len(frag) < 3:
+                continue
+            if not any(frag in lit for lit in lits):
+                dead.append((pat, frag))
+        self.assertEqual(dead, [],
+                         "这些 watchdog 模式在 --status 输出里已不存在（死模式，"
+                         "健康状态下可能恒真）：%s" % dead)
+
+    def test_negated_patterns_have_a_positive_anchor(self):
+        """`|| reasons+=(...)` 形式的判据必须有一个**正向锚点**。
+
+        「12h 预算」那条曾是这个形式，而锚点行已被删除 ->
+        条件永远为假 -> 默认分支每次都触发 -> 常态误报。
+        """
+        wd = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        lines = [l for l in wd.split(chr(10))
+                 if "||" in l and "reasons+=" in l]
+        lits = self._status_literals()
+        import re
+
+        # 更直接的检查：取该行 grep 的片段，确认它出现在 --status 模板里
+        import re
+        for l in lines:
+            m = re.search(r"""grep -qE? ['"]([^'"]+)['"]""", l)
+            self.assertIsNotNone(m, "取不到模式：%s" % l.strip())
+            frag = m.group(1)
+            self.assertTrue(any(frag in lit for lit in lits),
+                            "否定式判据的锚点 %r 在 --status 里不存在 -> "
+                            "条件恒假、默认分支每次触发" % frag)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

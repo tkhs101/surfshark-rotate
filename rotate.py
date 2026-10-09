@@ -80,7 +80,7 @@ SAME_IP_WARN = 3            # 连续 3 轮出口 IP 不变 -> 产出为零，开
 # 而可用的只是各节点 NAT 池的并集（VPS 实测下界：JP 47 / KR 32 / SG 17 / TW ?）。
 # 旧实现没有这个概念，所以「重现」只会发生、不会被发现。
 RECENT_WINDOW_H = 12
-ROUND_INTERVAL_MIN = 10      # 定时器间隔；改它之前先看 --status 的「12h 预算」
+ROUND_INTERVAL_MIN = 10      # 定时器间隔；改它之前先看 --status 的「12h 验证」那一段
 MAX_REDRAW = 8              # 撞到窗口内用过的地址时，最多重摇几次（每次约 6 秒）
 
 
