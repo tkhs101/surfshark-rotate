@@ -169,9 +169,21 @@ def log(msg):
 
 
 def api(path, method="GET", body=None, timeout=15):
+    """body 接受 dict / str / bytes，统一在这里编码。
+
+    早先只接受已编码的 bytes，于是任何一处忘了 `.encode()` 的调用都会在
+    `Request(data=...)` 里炸成 `TypeError: can't concat str to bytes` ——
+    而那是在**隧道已经切换之后**炸的，状态文件还没记账。
+    实测踩过：重摇路径的 `switch_and_reload` 传了 dict，04:39 那轮整轮崩溃，
+    recent 没更新、idx 没推进。编码责任放在这一层，而不是每个调用点。
+    """
     h = {"Authorization": f"Bearer {SECRET}"}
     if body is not None:
         h["Content-Type"] = "application/json"
+        if isinstance(body, (dict, list)):
+            body = json.dumps(body).encode("utf-8")
+        elif isinstance(body, str):
+            body = body.encode("utf-8")
     req = urllib.request.Request(API + path, method=method, data=body, headers=h)
     with urllib.request.urlopen(req, timeout=timeout) as r:
         raw = r.read()

@@ -1566,5 +1566,113 @@ class TestStatusHasNoFalseAlarm(unittest.TestCase):
                       "该出声的场合是「池子抽干」，不是「刚用过这个」")
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
+class TestRedrawPathActuallyRuns(RotateTestBase):
+    """重摇路径必须被**真的执行**过，不能只测 pick_next / remember_ip。
+
+    我写完重摇逻辑时，测试只覆盖了 pick_next 与 recent 这两个纯函数，
+    `switch_and_reload` 在整个测试文件里**零引用** —— 于是它第一次上机
+    执行就崩：`TypeError: can't concat str to bytes`（给 api() 传了 dict），
+    04:39 那轮整轮崩溃，recent 没更新、idx 没推进。
+    「看起来测过了」与「跑过了」之间隔着一次真实调用。
+    """
+
+    def test_api_encodes_dict_body(self):
+        """api() 必须自己处理编码，而不是要求每个调用点记得 encode。
+
+        真机崩过：重摇路径给 api() 传了 dict -> `TypeError: can't concat str
+        to bytes`，而且崩在**隧道已经切换之后**，状态文件还没记账。
+        这里直接断言「传进去的 data 是 bytes」，不经过 HTTP 桩 ——
+        桩的 400/401 会掩盖真正要测的东西。
+        """
+        import urllib.request as _u
+        r = self.rotate
+        seen = {}
+        real = _u.urlopen
+
+        def spy(req, timeout=None):
+            seen["data"] = req.data
+            seen["headers"] = dict(req.headers)
+            raise RuntimeError("stop-here")
+
+        self.patch(_u, "urlopen", spy)
+        self.patch(r, "SECRET", "x")
+        for body in ({"name": "JP 日本-东京"},
+                     '{"name": "JP 日本-东京"}',
+                     json.dumps({"name": "JP 日本-东京"}).encode("utf-8")):
+            seen.clear()
+            try:
+                r.api("/proxies/PROXY", "PUT", body)
+            except RuntimeError:
+                pass
+            self.assertIsInstance(seen.get("data"), bytes,
+                                  "传 %s 时 data 应为 bytes，实际 %r"
+                                  % (type(body).__name__, type(seen.get("data"))))
+            self.assertIn("name", json.loads(seen["data"].decode("utf-8")))
+
+
+    def test_switch_and_reload_hits_the_real_api(self):
+        self.seed()
+        FakeMihomo.groups["PROXY"]["now"] = "JP 日本-东京"
+        r = self.rotate
+        self.patch(r, "SECRET", "testsecret")
+        import time as _t
+        self.patch(r, "reload_config", lambda: _t.sleep(0))   # 只免掉那 5 秒
+        ok, err = r.switch_and_reload("KR 韩国-首尔")
+        self.assertTrue(ok, "switch_and_reload 失败：%s" % err)
+        puts = [r for r in FakeMihomo.requests
+                if r[0] == "PUT" and r[1].endswith("/proxies/PROXY")]
+        self.assertTrue(puts, "必须真的 PUT 过 /proxies/PROXY")
+        last = puts[-1][2]
+        if isinstance(last, bytes):
+            last = last.decode("utf-8")
+        # json.dumps 默认转义非 ASCII，所以要解析后比而不是子串匹配
+        self.assertEqual(json.loads(last).get("name"), "KR 韩国-首尔",
+                         "PUT /proxies/PROXY 的 body 必须是节点名")
+
+    def test_full_rotation_runs_the_redraw_branch(self):
+        """整条 rotate_once 在「撞到用过的地址」时必须跑通，而不是崩。
+
+        真机上这一段崩过：`TypeError: can't concat str to bytes`，
+        而且崩在**隧道已经切换之后** —— 状态文件还没记账。
+        """
+        self.seed()
+        r = self.rotate
+        seen = []
+        self.patch(r, "SECRET", "testsecret")
+        self.patch(r, "current_node", lambda: "JP 日本-东京")
+        self.patch(r, "reload_config", lambda: None)
+        self.patch(r, "exit_ip", lambda: "9.9.9.9")     # 固定成已用过的地址
+        self.patch(r, "recent_ips", lambda state, now=None: {"9.9.9.9"})
+        self.patch(r, "switch_and_reload",
+                   lambda n: (seen.append(n), (True, ""))[1])
+        self.quiet(r.rotate_once)
+        self.assertTrue(seen, "应该至少重摇一次（撞到窗口内用过的地址）")
+        self.assertLessEqual(len(seen), r.MAX_REDRAW, "重摇次数必须有上限")
+
+
+class TestStatusHasNoFalseAlarm(unittest.TestCase):
+    """--status 不得报「当前 IP 在记忆里」—— 它本来就应该在。
+
+    与上一轮修掉的 same_ip_streak 假告警同一个毛病，只换了张脸：
+    当前 IP 是最近一次轮换记进去的，拿它去问「是不是用过的」必然为真。
+    """
+
+    def test_status_excludes_current_and_last_from_spare(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn("ip in used", code,
+                         "拿当前 IP 去问「是不是用过」必然为真 —— 每轮都会假告警")
+        self.assertIn("spare", code)
+
+    def test_warns_only_when_pool_is_exhausted(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertIn("len(spare) <= 0", code,
+                      "该出声的场合是「池子抽干」，不是「刚用过这个」")
+
