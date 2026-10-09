@@ -1356,12 +1356,30 @@ def show_status():
         return
     st = load_state()
     now = autofall_now()
+    # 【三种状态，不是两种】
+    #   降级态          AUTOFALL=DIRECT 且状态文件也标了 degraded
+    #   正常态          两者都否
+    #   **状态不一致**  AUTOFALL=DIRECT 但状态文件说没降级
+    #
+    # 第三种以前被悄悄并进「降级态」—— 那是危险的那一侧：
+    # 状态文件一旦丢失/损坏（磁盘满、外部误删），--status 会把
+    # 「可能是有意的降级」和「AUTOFALL 卡在 DIRECT 上没人管」一起
+    # 报成「非异常」。而 status.sh 只看状态文件，在同一场景下会报
+    # 「⚠ 正在泄漏」—— **两者结论相反**。
+    #
+    # 按 ADR 的硬规则（误判泄漏比误判失败更糟），这里选择出声：
+    # 不知道意图时就当有泄漏，代价只是多喊一次。
+    inconsistent = (now == DEGRADED_TO) and not st.get("degraded")
     degraded = (now == DEGRADED_TO) or bool(st.get("degraded"))
     ip = exit_ip()
 
     log(f"降级状态 : {'是' if degraded else '否'}"
         + (f"  —— {st.get('degraded_reason') or now}（AUTOFALL={now}）" if degraded else ""))
     log(f"当前节点 : {node}")
+    if inconsistent:
+        log(f"⚠ 状态不一致 : AUTOFALL={now} 但状态文件说「没有降级」")
+        log("   状态文件丢失或损坏时会出现：没人再把 AUTOFALL 切回 PROXY，"
+            "且钩子闸门会判「明确未降级」直接返回。")
     if degraded:
         # ip.sb 现在固定挂在 PROXY 上（不在降级链里），所以降级时探测它
         # 必然失败、返回「取不到」—— 这本身就是「当前没走代理」的直接证据。
@@ -1424,6 +1442,12 @@ def show_status():
         log("  最可能：config.yaml 里 opencode.ai 的分流规则被改动，"
             "或 sniffer 失效导致域名没被还原、落进 MATCH,DIRECT。")
         log("  排查：sudo bash %s/status.sh" % BASE)
+    elif leaks and inconsistent:
+        log(f"泄漏检测 : {len(leaks)} 条走 DIRECT —— **且状态不一致**")
+        log(f"  AUTOFALL={now} 但状态文件说「没有降级」。")
+        log("  可能是状态文件丢失/损坏，于是没人再去把 AUTOFALL 切回 PROXY。")
+        log("  按「误判泄漏比误判失败更糟」，这里按有泄漏处理。")
+        log(f"  排查：{STATE_FILE} 是否还在、是否可读")
     elif leaks:
         log(f"泄漏检测 : {len(leaks)} 条走 DIRECT —— 降级期间属预期，非异常")
     else:

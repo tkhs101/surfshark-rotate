@@ -49,6 +49,8 @@ grep -q '轮换停摆' <<< "$clean" && reasons+=("轮换停摆：定时器没在
 # 然后直接 return —— 也就是说**后面所有检查都没跑**。这种「判据来源失效」
 # 必须喊出来，否则 watchdog 会把「什么都没检查」当成「一切正常」。
 grep -q 'mihomo API 不通' <<< "$clean" && reasons+=("判据失效：mihomo API 不通，--status 后续检查全部未执行")
+# 状态文件丢失/损坏时：AUTOFALL 卡在 DIRECT，但没人再负责切回来。
+grep -q '状态不一致' <<< "$clean" && reasons+=("状态不一致：AUTOFALL 停在 DIRECT 但状态文件说没降级（多半是状态文件丢了）")
 grep -q '12h 预算' <<< "$clean" || reasons+=("读不到 12h 预算 —— 判据来源可能失效")
 # 「池子抽干」只在确实轮换过、且 now 无 spare 时才算数。
 # 早先无条件 grep 那句，全新安装（只有 1 条记录、last_ip=None）时

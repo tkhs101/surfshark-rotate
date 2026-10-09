@@ -848,8 +848,7 @@ class TestTriStateVerdict(unittest.TestCase):
         # 前面还有一个把原始输出归一化的转换块。
         i = t.index('case "$LEAK_N" in')
         seg = t[i:t.index("esac", i)]
-        self.assertIn('DEG_FLAG" = "true"', seg,
-                      "门必须用 DEG_FLAG；用 AF_NOW 会在钩子恢复窗口里自相矛盾")
+        self.assertIn('DEG_FLAG" = "true"', seg, "门必须用 DEG_FLAG；用 AF_NOW 会在钩子恢复窗口里自相矛盾")
 
 
 class TestNoMaterialisation(RotateTestBase):
@@ -2047,6 +2046,108 @@ class TestAlertLinesAllHaveAWatchdogPattern(unittest.TestCase):
             self.skipTest("show_status 里没有 IP 反查 相关行")
         self.assertFalse(any(frag in p for p in broken),
                          "改名后矩阵竟然还是绿的 —— 它没在检查覆盖率")
+
+
+class TestShowStatusReallyRuns(RotateTestBase):
+    """**真的跑一遍** `show_status`，把真实输出打给 watchdog 的模式。
+
+    前面的矩阵是**静态扫源码**的告警字面量 —— 它抓得住「新增告警行忘加模式」，
+    抓不住「模式写对了但措辞对不上」。评审那一轮的 5 条死模式全都是后者。
+
+    做法：拿假 mihomo 造出几种状态，实跑 `show_status`，
+    然后把 watchdog 的真实 `grep -qE` 模式打到真实输出上。
+    这就是评审手工做的 matrix，只是固化成测试。
+    """
+
+    def _run_status(self, state_patch=None, groups=None, connections=None,
+                    autofall="PROXY"):
+        self.seed()
+        r = self.rotate
+        if state_patch:
+            import json as _json
+            s = _json.loads(pathlib.Path(r.STATE_FILE).read_text(encoding="utf-8"))
+            s.update(state_patch)
+            pathlib.Path(r.STATE_FILE).write_text(
+                _json.dumps(s, ensure_ascii=False), encoding="utf-8")
+        if groups:
+            FakeMihomo.groups.update(groups)
+        FakeMihomo.connections = connections or []
+        self.patch(r, "exit_ip", lambda: "1.1.1.1")
+        self.patch(r, "current_node", lambda: "JP 日本-东京")
+        self.patch(r, "autofall_now", lambda: autofall)
+        self.patch(r, "conns_on", lambda n: 0)
+        self.patch(r, "_leak_ips", lambda ttl=None: {"9.9.9.9"})
+        self.patch(r, "_leak_ip_lookup_ok", lambda: True)
+        self.patch(r, "subprocess", type("S", (), {
+            "run": staticmethod(lambda *a, **k: type(
+                "R", (), {"stdout": "active", "returncode": 0})())}))
+        import io, sys
+        buf = io.StringIO(); old = sys.stdout; sys.stdout = buf
+        try:
+            r.show_status()
+        finally:
+            sys.stdout = old
+        import re
+        return re.sub(r"\[[0-9;]*m", "", buf.getvalue())
+
+    def _patterns(self):
+        import re
+        wd = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        code = chr(10).join(l for l in wd.split(chr(10))
+                            if not l.strip().startswith("#"))
+        return re.findall(r"""grep -qE? ['"]([^'"]+)['"]""", code)
+
+    def test_healthy_output_has_no_alert_reason(self):
+        out = self._run_status()
+        self.assertNotIn("!!", out, "健康状态不该有 !! 级告警: " + out[:400])
+        self.assertNotIn("??", out, "健康状态不该有 ?? 级告警")
+
+    def test_degraded_state_is_alerted(self):
+        out = self._run_status(
+            state_patch={"degraded": True, "degraded_reason": "测试"},
+            autofall="DIRECT")
+        import re
+        pats = self._patterns()
+        self.assertTrue(any("降级状态 : 是" in p for p in pats),
+                        "watchdog 没有覆盖降级态")
+        self.assertIn("降级状态 : 是", out, "降级态的 --status 输出没体现: " + out[:300])
+        hit = [p for p in pats if p in out]
+        self.assertTrue(hit, "降级态下没有任何 watchdog 模式命中")
+
+    def test_inconsistent_state_is_alerted(self):
+        """AUTOFALL=DIRECT 但状态文件说没降级 —— 必须是第三种状态，不能混进降级。"""
+        out = self._run_status(state_patch={"degraded": None},
+                               autofall="DIRECT")
+        self.assertIn("状态不一致", out,
+                      "AUTOFALL=DIRECT 而状态说没降级时，--status 必须单独报出来："
+                      + out[:400])
+        pats = self._patterns()
+        self.assertTrue(any("状态不一致" in p for p in pats),
+                        "watchdog 没覆盖「状态不一致」—— 而它多半意味着状态文件丢了")
+
+    def test_routing_violation_is_alerted(self):
+        out = self._run_status(state_patch={
+            "routing_bad_at": "2026-01-01 00:00:00",
+            "routing_bad_reason": "测试用"})
+        pats = self._patterns()
+        self.assertTrue(any("分流规则异常" in p for p in pats))
+        self.assertIn("分流规则异常", out, "分流违规必须出现在 --status：" + out[:400])
+
+    def test_every_prefect_covered_alert_fires_on_real_output(self):
+        """反向矩阵在**真实输出**上再跑一遍 —— 静态扫只保证「有行」，这里保证「行能被打中」。"""
+        import re
+        out = self._run_status(
+            state_patch={"degraded": True, "degraded_reason": "测试",
+                         "routing_bad_at": "2026-01-01 00:00:00",
+                         "routing_bad_reason": "测试用",
+                         "last_redraw_failed": "测试用"},
+            autofall="DIRECT")
+        pats = self._patterns()
+        fired = [p for p in pats if re.search(p, out)]
+        self.assertGreaterEqual(
+            len(fired), 3,
+            "多种告警同时出现时，真实输出上只打中了 %d 条模式：%s / 输出=%s"
+            % (len(fired), fired, out[:600]))
 
 
 if __name__ == "__main__":
