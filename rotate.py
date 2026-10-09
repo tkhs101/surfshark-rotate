@@ -235,8 +235,6 @@ def _load_verify_cmd():
         return ""
 
 
-# 轮换锁：定时器与 429 钩子可能同时触发，必须互斥。
-ROTATE_LOCK = os.path.join(BASE, ".rotate.lock")
 CONFIG_PATH = os.environ.get("ROTATE_CONFIG_PATH") or os.path.join(BASE, "config.yaml")
 
 
@@ -1720,9 +1718,6 @@ def main():
                     help="探测当前节点连续健康（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--probes", type=int, default=2, help="--probe-node 的采样次数")
     ap.add_argument("--gap", type=int, default=8, help="--probe-node 的采样间隔秒")
-    ap.add_argument("--report-429", nargs="?", const="", metavar="IP",
-                    help="上报一次 429：拉黑该 IP（缺省用当前出口）并立即轮换。"
-                         "供客户端/包装脚本调用，是「遇到 429 就换」闭环的入口。")
     ap.add_argument("--recheck-tried", action="store_true",
                     help="复查计数 +1 并打印（供 on-mihomo-up.sh 调用）")
     ap.add_argument("--reset-recheck", action="store_true",
@@ -1735,27 +1730,6 @@ def main():
     # on-mihomo-up.sh 曾经自带一份硬编码的 key 列表来清状态，于是状态 schema
     # 有两个写入方、各维护一份清单，迟早会漏掉某个键 —— 而漏掉的恰恰是
     # 「标记已恢复」这类语义最重的键。改成调用本函数，让 schema 只有一个 owner。
-    if args.report_429 is not None:
-        # 与定时器互斥：两者可能同时触发，撞在一起会写出撕裂的状态。
-        with open(ROTATE_LOCK, "w") as lf:
-            fcntl.flock(lf, fcntl.LOCK_EX)
-            try:
-                st = load_state()
-                ip = args.report_429 or st.get("last_ip") or exit_ip()
-                if not ip:
-                    log("上报 429 但取不到当前出口 IP —— 无法拉黑，也不轮换")
-                    return 3
-                log(f"收到 429 上报，出口 IP = {ip}")
-                if is_blacklisted(st, ip):
-                    log(f"    {ip} 已在黑名单里（未重复记录）")
-                else:
-                    blacklist_add(st, ip, "客户端上报 429")
-                # 立刻落盘再轮换：即使轮换失败，拉黑这件事也必须留住，
-                # 否则下一次轮换又会抽回同一个脏 IP。
-                update_state({"blacklist": prune_blacklist(st.get("blacklist"))})
-            finally:
-                fcntl.flock(lf, fcntl.LOCK_UN)
-        log("立即轮换")
         return 0 if rotate_once(dry_run=args.dry_run) else 1
 
 

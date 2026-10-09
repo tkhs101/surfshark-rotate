@@ -2580,38 +2580,6 @@ class TestBlacklist(unittest.TestCase):
                       "黑名单条目必须加进 seen，重摇才会避开")
 
 
-class TestReport429Hook(unittest.TestCase):
-    """--report-429：外部上报 429 -> 拉黑 + 立即轮换。"""
-
-    def test_flag_exists(self):
-        import rotate as _r
-        self.assertTrue(hasattr(_r, "ROTATE_LOCK"),
-                        "轮换锁：定时器与钩子可能同时触发")
-
-    def test_cli_flag_is_wired(self):
-        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
-        self.assertIn("--report-429", src)
-        self.assertIn("args.report_429 is not None", src)
-
-    def test_blacklist_persisted_before_rotating(self):
-        """必须先落盘再轮换 —— 否则轮换失败就丢了拉黑记录。"""
-        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
-        i = src.index("if args.report_429 is not None:")
-        j = src.index("立即轮换", i)
-        seg = src[i:j]
-        self.assertIn("update_state", seg,
-                      "拉黑必须先落盘，否则下一次轮换又会抽回同一个脏 IP")
-        self.assertLess(seg.index("update_state"), seg.index("rotate_once")
-                        if "rotate_once" in seg else len(seg))
-
-    def test_report_hook_respects_lock(self):
-        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
-        i = src.index("if args.report_429 is not None:")
-        seg = src[i:src.index("立即轮换", i)]
-        self.assertIn("fcntl.flock", seg, "钩子必须与定时器互斥")
-
-
-
 class TestBlacklistExpiresPerEntry(unittest.TestCase):
     """黑名单**逐条**过期，不是每 12 小时整体清空一次。
 
