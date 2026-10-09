@@ -1939,5 +1939,115 @@ class TestWatchdogIsActuallyWired(unittest.TestCase):
         self.assertIn("watchdog", self._n("README.md"))
 
 
+class TestRedrawVisitsEachNodeOnce(unittest.TestCase):
+    """重摇必须每次换一个**没试过**的节点。
+
+    早先用 `pick_next(state, skip=redraws)`：skip 对 len(NODES) 取模，
+    而 MAX_REDRAW(8) > len(NODES)(4) —— 第 5 次重摇起就绕回试过的节点。
+    「换一个池子抽」在绕圈后失效，等于把「原地重摇 0/9」做了两遍。
+    """
+
+    def test_skip_would_wrap_around(self):
+        import rotate as _r
+        self.assertGreater(_r.MAX_REDRAW, len(_r.NODES),
+                           "若 MAX_REDRAW <= 节点数，skip 不会绕圈，这条测试的前提消失")
+
+    def test_skip_returns_already_tried_nodes(self):
+        """证明 skip 确实会绕圈 —— 这是修它的理由，不是假设。"""
+        import rotate as _r
+        st = {"idx": 0}
+        seq = [_r.pick_next(st, skip=k) for k in range(_r.MAX_REDRAW)]
+        self.assertLess(len(set(seq)), len(seq),
+                        "skip 已经不绕圈了？（MAX_REDRAW=%d, 节点数=%d）"
+                        % (_r.MAX_REDRAW, len(_r.NODES)))
+
+    def test_rotate_source_tracks_tried_nodes(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("    seen = recent_ips(state)")
+        blk = src[i:src.index("if new_ip and new_ip in seen:", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertIn("tried", code,
+                      "重摇循环必须显式记录已试过的节点")
+        self.assertNotIn("skip=redraws", code,
+                         "skip 绕圈后「换一个池子抽」失效")
+
+
+class TestAlertLinesAllHaveAWatchdogPattern(unittest.TestCase):
+    """反向矩阵：`show_status` 里**每一条**告警行都必须有 watchdog 模式覆盖。
+
+    这是「锁死已知死模式」的替代品。旧做法是一个两个字面量的黑名单，
+    评审实测：注入一条**全新**的死模式（`IP 反查 : 不可用` ->
+    `探测通道固定走 PROXY`），128 个用例**全绿** —— 而那版实际上机了，
+    半盲告警在该响时不响、降级时误响、而理由还写着「按 IP 反查」。
+
+    黑名单的盲区是结构性的：它只认已知的那几个。
+    反向矩阵不认任何具体文案 —— 它只问「你新加的告警行，有人管吗」。
+
+    做法：静态扫 `show_status` 里所有带告警前缀（⚠ / !! / ??）的字面量行，
+    断言每条都被某个 `grep -q` 模式覆盖。这不需要造状态。
+    """
+
+    ALERT_PREFIXES = ("⚠", "!!", "??")
+
+    def _alert_literals(self):
+        """show_status 里所有以告警前缀开头的输出模板。"""
+        import re
+        rot = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = rot.index("def show_status")
+        blk = rot[i:rot.index(chr(10) + "def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        out = []
+        pat = r"log\(\s*f?[\"']([^\"']+)"
+        for m in re.finditer(pat, code):
+            s = m.group(1)
+            if s.startswith(self.ALERT_PREFIXES):
+                out.append(s)
+        return out
+
+    def _watchdog_patterns(self):
+        import re
+        wd = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
+        code = chr(10).join(l for l in wd.split(chr(10))
+                            if not l.strip().startswith("#"))
+        return re.findall(r"""grep -qE? ['"]([^'"]+)['"]""", code)
+
+    def test_every_alert_line_is_covered(self):
+        import re
+        alerts = self._alert_literals()
+        self.assertGreater(len(alerts), 3,
+                           "扫不到告警行 —— 扫描逻辑坏了，本测试会假绿")
+        pats = self._watchdog_patterns()
+        uncovered = []
+        for a in alerts:
+            # 取模板里的最长中文/标识符片段作为「这行代表什么」
+            # 取**冒号前的标签**而不是最长中文片段 —— 标签是稳定标识
+            # （`轮换停摆`、`分流规则异常`），而正文会随措辞变化
+            # （早先取最长片段，把 `轮换停摆 : xxx` 切成 `不是 active`，
+            #  于是一条已覆盖的告警被误报成漏）。
+            frag = re.split(r"[：:]|——", a.lstrip(" ⚠!?").strip())[0].strip()
+            if len(frag) < 3:
+                continue
+            if not any(frag in p for p in pats):
+                uncovered.append((a[:40], frag))
+        self.assertEqual(uncovered, [],
+                         "这些告警行没有任何 watchdog 模式覆盖：%s" % uncovered)
+
+    def test_the_matrix_would_catch_a_renamed_pattern(self):
+        """自证：把一个模式改成无关串，矩阵必须报出来。"""
+        alerts = self._alert_literals()
+        pats = self._watchdog_patterns()
+        broken = [p.replace("IP 反查", "探测通道") for p in pats]
+        frag = None
+        for a in alerts:
+            if "IP 反查" in a:
+                frag = "IP 反查"
+        if frag is None:
+            self.skipTest("show_status 里没有 IP 反查 相关行")
+        self.assertFalse(any(frag in p for p in broken),
+                         "改名后矩阵竟然还是绿的 —— 它没在检查覆盖率")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1281,9 +1281,22 @@ def rotate_once(dry_run=False):
     # 在同一个节点上原地重摇，抽中的必然是用过的。**换一个池子抽**才解决。
     seen = recent_ips(state)
     redraws = 0
+    # 【重摇必须每次换一个**没试过**的节点，而不是靠 skip 往后挪】
+    # 早先是 `pick_next(state, skip=redraws)`。skip 是对 len(NODES) 取模的，
+    # 而 MAX_REDRAW(8) > len(NODES)(4) —— 于是第 5 次重摇起就绕回已经试过的
+    # 节点，「换一个池子抽」这个核心机制在绕圈后失效：
+    # 原地重摇实测接受率 0/9，绕圈重摇只是把同一个 0/9 做了两遍。
+    # 现在显式记录本轮已试过的节点，试完一圈就停。
+    tried = {live, target}
     while new_ip in seen and redraws < MAX_REDRAW:
+        nxt = next((n for n in NODES
+                    if n not in tried), None)
+        if nxt is None:
+            log(f"    四个节点的池子都试过了（已重摇 {redraws} 次）—— 停止，"
+                f"本轮接受 {new_ip}")
+            break
+        tried.add(nxt)
         redraws += 1
-        nxt = pick_next(state, skip=redraws)
         log(f"    该地址 {new_ip} 在 {RECENT_WINDOW_H}h 内已用过 → 换节点重摇 "
             f"（第 {redraws}/{MAX_REDRAW} 次，试 {nxt}）")
         ok, err = switch_and_reload(nxt)
@@ -1416,7 +1429,7 @@ def show_status():
     else:
         log(f"泄漏检测 : 未发现 {LEAK_HOST} 走直连")
     if not _leak_ip_lookup_ok():
-        log(f"IP 反查  : 不可用（{LEAK_HOST} 解析失败）—— 本次判定只按域名匹配，")
+        log(f"⚠ IP 反查  : 不可用（{LEAK_HOST} 解析失败）—— 本次判定只按域名匹配，")
         log("           而 sniffer 失效正是要覆盖的场景之一。")
     log(f"当前节点位 : {(int(st.get('idx', 0)) - 1) % len(NODES) + 1} / {len(NODES)}")
 
