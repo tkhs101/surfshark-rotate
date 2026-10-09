@@ -120,6 +120,23 @@ class FakeMihomo(BaseHTTPRequestHandler):
 
 
 class RotateTestBase(unittest.TestCase):
+    """【为什么提供 patch() 而不是直接赋值】
+
+    直接 `r.pick_next = lambda ...` 会**永久**改掉模块属性 —— 而测试之间
+    共享同一个模块实例，于是这个补丁会漏到后面的测试类里去。实测就是这么
+    发现的：TestDegradeCorroboration 把 pick_next 打成 lambda 且从不还原，
+    导致后面新写的轮询测试在**被污染的模块**上运行。
+    而且 lambda 的签名会随真实 API 演进而悄悄过时。
+
+    patch() 用 addCleanup 保证还原，跑测顺序就不再影响结果。
+    """
+
+    def patch(self, obj, name, value):
+        old = getattr(obj, name)
+        self.addCleanup(setattr, obj, name, old)
+        setattr(obj, name, value)
+        return value
+
     @classmethod
     def setUpClass(cls):
         cls.srv = HTTPServer(("127.0.0.1", 0), FakeMihomo)
@@ -292,9 +309,9 @@ class TestDebounce(RotateTestBase):
         super().setUp()
         r = self.rotate
         r.current_node = lambda: "JP 日本-东京"
-        r.pick_next = lambda s: (0, "JP 日本-东京")
-        r.switch = lambda n: None
-        r.reload_config = lambda: None
+        self.patch(r, "pick_next", lambda s, skip=0: "JP 日本-东京")
+        self.patch(r, "switch", lambda n: None)
+        self.patch(r, "reload_config", lambda: None)
         r.node_healthy = lambda n, timeout_ms=8000: self.healthy[0]
 
     def run_once(self):
@@ -336,9 +353,9 @@ class TestDegradeCorroboration(RotateTestBase):
         super().setUp()
         r = self.rotate
         r.current_node = lambda: "JP 日本-东京"
-        r.pick_next = lambda s: (0, "JP 日本-东京")
-        r.switch = lambda n: None
-        r.reload_config = lambda: None
+        self.patch(r, "pick_next", lambda s, skip=0: "JP 日本-东京")
+        self.patch(r, "switch", lambda n: None)
+        self.patch(r, "reload_config", lambda: None)
 
     def test_healthy_tunnel_never_degrades(self):
         self.seed()
@@ -1396,7 +1413,9 @@ class TestRunnerOrder(unittest.TestCase):
 
     def test_no_test_class_is_defined_after_the_runner(self):
         src = (ROOT / "tests/test_rotate.py").read_text(encoding="utf-8")
-        runner = src.index('if __name__ == "__main__":')
+        # 用 rindex：文件里 TestRunnerOrder 自己的断言字符串也含这段文本，
+        # index() 会命中那个字面量而不是真 runner（我自己踩过）。
+        runner = src.rindex('if __name__ == "__main__":')
         tail = src[runner:]
         import re as _r
         classes = _r.findall(r"^class (Test\w+)", tail, _r.M)
@@ -1424,6 +1443,127 @@ class TestRunnerOrder(unittest.TestCase):
         self.assertEqual(missing, set(),
                          "这些测试类没有被 loader 收集到：%s" % sorted(missing))
 
+
+
+class TestRotationStrategy(unittest.TestCase):
+    """12 小时内不重复：扁平轮询 + recent 记忆 + 撞重复换节点重摇。
+
+    实测 48h/181 周期：JP 90 / KR 91 / **SG 0 / TW 0**，相邻两次相同 **0 次**
+    -> 旧结构的 tier 恒为 0，整套分档是死代码，而它让人以为备用节点是活的。
+    """
+
+    def setUp(self):
+        import rotate as _r
+        self.r = _r
+
+    def test_all_four_nodes_are_in_rotation(self):
+        self.assertEqual(len(self.r.NODES), 4, "SG/TW 必须在轮询里，否则一次也用不上")
+        for n in ("JP", "KR", "SG", "TW"):
+            self.assertTrue(any(x.startswith(n) for x in self.r.NODES),
+                            "%s 不在 NODES 里" % n)
+
+    def test_pick_next_cycles_through_all_nodes(self):
+        st = {"idx": 0}
+        seen = []
+        for _ in range(len(self.r.NODES) * 2):
+            seen.append(self.r.pick_next(st))
+            st["idx"] += 1
+        self.assertEqual(len(set(seen[:4])), 4, "一个完整周期必须经过四个节点")
+        self.assertEqual(seen[:4], seen[4:], "第二个周期应完全重复")
+
+    def test_skip_moves_to_a_different_pool(self):
+        """重摇**必须换节点** —— 原地重摇实测接受率 0/9。"""
+        st = {"idx": 0}
+        base = self.r.pick_next(st)
+        self.assertNotEqual(self.r.pick_next(st, skip=1), base,
+                            "skip 不换节点 = 原地重摇，实测永远抽到用过的地址")
+
+    def test_recent_window_expires(self):
+        now = 1700000000
+        fresh = self.r.remember_ip({"recent": []}, "1.2.3.4", now=now)
+        self.assertEqual(self.r.recent_ips({"recent": fresh}, now=now + 60), {"1.2.3.4"})
+        later = now + (self.r.RECENT_WINDOW_H + 1) * 3600
+        self.assertEqual(self.r.recent_ips({"recent": fresh}, now=later), set(),
+                         "超过窗口的地址必须被忘掉，否则集合只增不减")
+
+    def test_recent_dedupes_same_ip(self):
+        now = 1700000000
+        s = {"recent": self.r.remember_ip({"recent": []}, "9.9.9.9", now=now)}
+        s["recent"] = self.r.remember_ip(s, "9.9.9.9", now=now + 30)
+        self.assertEqual(len(s["recent"]), 1, "同一个 IP 只留最新一条")
+
+    def test_budget_arithmetic_is_achievable(self):
+        """12h 需要的不同地址数必须 <= 实测池并集，否则数学上不可能达标。"""
+        need = 720 // self.r.ROUND_INTERVAL_MIN
+        pools = {"JP 日本-东京": 47, "KR 韩国-首尔": 32,
+                 "SG 新加坡": 17, "TW 台湾-台北": 15}
+        union = sum(pools[n] for n in self.r.NODES if n in pools)
+        self.assertLessEqual(need, union,
+                             "间隔 %d 分钟 -> 12h 需 %d 个不同地址，"
+                             "而实测池并集只有 %d —— 数学上不可能不重复"
+                             % (self.r.ROUND_INTERVAL_MIN, need, union))
+
+    def test_five_minute_interval_is_now_infeasible(self):
+        """5 分钟是这个配置的边界之外 —— 必须被显式承认。"""
+        need = 720 // 5
+        union = 47 + 32 + 17 + 15
+        self.assertGreater(need, union,
+                           "若这条不再成立（池子变大），可以重新评估间隔")
+
+    def test_dead_tier_keys_are_gone(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        code = chr(10).join(l for l in src.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn('state["tier"]', code)
+        self.assertNotIn("same_ip_streak", code,
+                         "只在「与上次完全相同」时递增，实测 181 周期 0 次触发")
+
+
+class TestIntervalMatchesBudget(unittest.TestCase):
+    """定时器间隔与 12h 预算必须一致 —— 这两处以前没有任何东西关联着。"""
+
+    def test_timer_interval_matches_rotate_constant(self):
+        import rotate as _r
+        unit = (ROOT / "surfshark-rotate.timer").read_text(encoding="utf-8")
+        import re
+        m = re.search(r"OnUnitActiveSec=(\d+)min", unit)
+        self.assertIsNotNone(m, "定时器应显式声明分钟间隔")
+        self.assertEqual(int(m.group(1)), _r.ROUND_INTERVAL_MIN,
+                         "定时器间隔与 rotate.py 的 ROUND_INTERVAL_MIN 不一致 —— "
+                         "预算算的是另一个数")
+
+    def test_five_minutes_is_rejected_by_the_budget(self):
+        """5 分钟是边界之外。若哪天池子变大，这条会红，那是重新评估的信号。"""
+        import rotate as _r
+        union = 47 + 32 + 17 + 15
+        self.assertGreater(720 // 5, union)
+
+
+class TestStatusHasNoFalseAlarm(unittest.TestCase):
+    """--status 不得报「当前 IP 在记忆里」—— 它本来就应该在。
+
+    与上一轮修掉的 same_ip_streak 假告警同一个毛病，只换了张脸：
+    当前 IP 是最近一次轮换记进去的，拿它去问「是不是用过的」必然为真。
+    """
+
+    def test_status_excludes_current_and_last_from_spare(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertNotIn("ip in used", code,
+                         "拿当前 IP 去问「是不是用过」必然为真 —— 每轮都会假告警")
+        self.assertIn("spare", code)
+
+    def test_warns_only_when_pool_is_exhausted(self):
+        src = (ROOT / "rotate.py").read_text(encoding="utf-8")
+        i = src.index("def show_status")
+        blk = src[i:src.index("def main(", i)]
+        code = chr(10).join(l for l in blk.split(chr(10))
+                            if not l.strip().startswith("#"))
+        self.assertIn("len(spare) <= 0", code,
+                      "该出声的场合是「池子抽干」，不是「刚用过这个」")
 
 
 if __name__ == "__main__":

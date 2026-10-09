@@ -9,7 +9,7 @@ OnBootSec=3min
 
 # 「本服务上次激活 5 分钟后」再次触发。
 # 选 OnUnitActiveSec 而不是 OnCalendar：上一轮慢了几秒不会让节奏累积漂移。
-OnUnitActiveSec=5min
+OnUnitActiveSec=10min
 
 # 关机/休眠期间错过的触发，开机后补跑一次，不会因为停机就永久丢失轮换
 Persistent=true

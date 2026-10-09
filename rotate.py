@@ -74,6 +74,33 @@ DEGRADED_TO = "DIRECT"
 # 不能是 1：单轮取不到可能只是某个 CDN 边缘节点抖动。
 # 也不能太大：定时器 5 分钟一轮，3 轮就是 15 分钟无谓的空转。
 SAME_IP_WARN = 3            # 连续 3 轮出口 IP 不变 -> 产出为零，开始出声
+
+# 出口 IP 的记忆窗口。需求是「12 小时内不重复」——
+# 12h x 每 ROUND_INTERVAL_MIN 分钟 = 需要 720/间隔 个**互不相同**的地址，
+# 而可用的只是各节点 NAT 池的并集（VPS 实测下界：JP 47 / KR 32 / SG 17 / TW ?）。
+# 旧实现没有这个概念，所以「重现」只会发生、不会被发现。
+RECENT_WINDOW_H = 12
+ROUND_INTERVAL_MIN = 10      # 定时器间隔；改它之前先看 --status 的「12h 预算」
+MAX_REDRAW = 8              # 撞到窗口内用过的地址时，最多重摇几次（每次约 6 秒）
+
+
+def prune_recent(entries, now=None):
+    """丢掉窗口外的记录，返回 [(epoch, ip), ...] 按时间升序。"""
+    now = time.time() if now is None else now
+    cutoff = now - RECENT_WINDOW_H * 3600
+    return [(ts, ip) for ts, ip in (entries or []) if ts >= cutoff and ip]
+
+
+def recent_ips(state, now=None):
+    return {ip for _, ip in prune_recent(state.get("recent"), now)}
+
+
+def remember_ip(state, ip, now=None):
+    """把刚用过的地址记进窗口。同一 IP 只留最新一条。"""
+    now = time.time() if now is None else now
+    kept = [(ts, x) for ts, x in prune_recent(state.get("recent"), now) if x != ip]
+    kept.append((now, ip))
+    return sorted(kept)
 DEGRADE_AFTER_FAILS = 2
 
 # 恢复侧的去抖次数。
@@ -114,18 +141,21 @@ def _secret_from_config(path):
 
 SECRET = os.environ.get("ROTATE_SECRET") or _secret_from_config(CONFIG_PATH)
 
-# 优先级分档：先在第一档内轮换，拿不到新 IP 才降档。
+# 轮询节点（扁平，不再分档）。
 #
-# 【这一项跟机器强相关】分档顺序必须按**部署目标机**的实际延迟排。
-# 各区域差异极大：同一台机器上 JP 可能是 2ms 而 SG 是 77ms，
-# 照抄别处的顺序等于平时就在用最差的节点。
+# 【为什么不再是分档】旧结构是 TIERS[0]=[JP,KR]，档内严格交替，
+# 而「降档」只在 `new_ip == old_ip`（与上一次**完全相同**）时才触发。
+# 实测 48 小时 181 个周期：JP 90 / KR 91 / SG 0 / TW 0 ——
+# **相邻两次相同的次数是 0**，所以 tier 永远停在 0，SG/TW 一次都没启用过。
+# 那套分档逻辑实际上是死代码，却让人以为「备用节点」是活的。
 #
-# 换机器或换机房后，用同目录的 measure-nodes.sh 重测并把结果粘回来：
-#     bash measure-nodes.sh
-TIERS = [
-    ["JP 日本-东京", "KR 韩国-首尔"],
-    ["TW 台湾-台北"],
-    ["SG 新加坡"],
+# 【顺序按实测延迟排，机器相关】各区域差异极大（同一台机器上 JP 可能 2ms
+# 而 SG 77ms）。换机器后用同目录的 measure-nodes.sh 重测再调整顺序。
+NODES = [
+    "JP 日本-东京",
+    "KR 韩国-首尔",
+    "TW 台湾-台北",
+    "SG 新加坡",
 ]
 # ============================================================
 
@@ -969,11 +999,24 @@ def reset_recheck_tries():
     update_state({"recheck_tries": 0}, require_existing=True)
 
 
-def pick_next(state):
-    """按优先级挑下一个节点：档内循环，降档后继续"""
-    tier = state.get("tier", 0) % len(TIERS)
-    nodes = TIERS[tier]
-    return tier, nodes[state.get("idx", 0) % len(nodes)]
+def pick_next(state, skip=0):
+    """扁平轮询下一个节点；skip 用于「重摇时换一个池子抽」。"""
+    idx = int(state.get("idx", 0))
+    return NODES[(idx + skip) % len(NODES)]
+
+
+def switch_and_reload(node):
+    """切节点 + 热重载。热重载才是真正重建 WireGuard 隧道的那一步。
+
+    只切节点**不会**换出口 IP —— 实测 8 次切走再切回，IP 一次没变。
+    返回 (是否成功, 错误文本)。
+    """
+    try:
+        api("/proxies/PROXY", "PUT", {"name": node})
+        reload_config()          # 成功则正常返回，失败会抛
+    except (urllib.error.HTTPError, RuntimeError) as e:
+        return False, str(e)[:160]
+    return True, ""
 
 
 # ------------------------------------------------------------
@@ -1007,7 +1050,7 @@ def rotate_once(dry_run=False):
             log("   放弃本次轮换")
             return False
 
-    tier, target = pick_next(state)
+    target = pick_next(state)
 
     # 降级态下的唯一出路是节点真的恢复。判据走控制面（节点 delay 探测），
     # 不用 AUTOFALL 的当前选择 —— 那正是我们自己设成 DIRECT 的，
@@ -1064,8 +1107,8 @@ def rotate_once(dry_run=False):
         set_autofall("PROXY")
 
     old_ip = state.get("last_ip")
-    log(f"--- 轮换开始 | 当前节点={live} | 档位={tier+1}/{len(TIERS)} "
-        f"({TIERS[tier][0]}...) ---")
+    log(f"--- 轮换开始 | 当前节点={live} | 目标={target} | "
+        f"节点池={'/'.join(n[:2] for n in NODES)} ---")
 
     # 1) 核对已加载的分流规则
     #
@@ -1216,34 +1259,53 @@ def rotate_once(dry_run=False):
 
     log(f"    出口IP：{old_ip or '(未知)'} -> {new_ip}")
 
-    if old_ip and new_ip == old_ip:
-        log("    IP 未变化 → 降到下一档备用节点")
-        state["tier"] = tier + 1
-        state["idx"] = 0
-        # 连续「取到了出口 IP、但和上次一样」的次数。
-        # 这是一个**产出为零但全绿**的状态：每轮都打印「完成」、退出码 0，
-        # 而项目唯一的存在理由（换 IP）没有任何进展。数据本来就在手里，
-        # 只差记一下让 status.sh 能看见。
-        unchanged = int(state.get("same_ip_streak") or 0) + 1
-        state["same_ip_streak"] = unchanged
-        if unchanged >= SAME_IP_WARN:
-            log(f"    ⚠ 连续 {unchanged} 轮取到的出口 IP 与上次相同 —— "
-                f"轮换产出为零。检查 status.sh 或换节点/换私钥。")
-    else:
-        state["same_ip_streak"] = 0
-        state["idx"] = state.get("idx", 0) + 1
-        if tier > 0 and new_ip:
-            # 备用档成功换到新 IP，就逐步升回低延迟档
-            state["tier"] = tier - 1
-            log(f"    备用档成功 → 升回第 {state['tier']+1} 档")
+    # ---- 撞到窗口内用过的地址就换节点重摇 ----
+    #
+    # 【为什么要重摇而不是「拿到什么用什么」】需求是 12 小时内不重复，
+    # 而池子有限（VPS 实测下界 JP 47 / KR 32 / SG 17）。仅靠轮询，重复是必然的。
+    #
+    # 【关键：重摇必须同时换节点】早先只做了「原地重摇」—— 实测接受率 0/9：
+    # 旧配置 5 分钟一轮只轮 JP/KR，12 小时就把两池合计 79 个地址用掉了大半，
+    # 在同一个节点上原地重摇，抽中的必然是用过的。**换一个池子抽**才解决。
+    seen = recent_ips(state)
+    redraws = 0
+    while new_ip in seen and redraws < MAX_REDRAW:
+        redraws += 1
+        nxt = pick_next(state, skip=redraws)
+        log(f"    该地址 {new_ip} 在 {RECENT_WINDOW_H}h 内已用过 → 换节点重摇 "
+            f"（第 {redraws}/{MAX_REDRAW} 次，试 {nxt}）")
+        ok, err = switch_and_reload(nxt)
+        if not ok:
+            log(f"    重摇失败：{err}")
+            break
+        target, new_ip = nxt, exit_ip()
+        if not new_ip:
+            log("    重摇后取不到出口 IP，保留本轮结果")
+            break
 
+    if new_ip and new_ip in seen:
+        # 重摇次数用尽仍未避开 —— 这时**说出来**，不要假装达标。
+        used = len(seen)
+        log(f"    ⚠ 重摇 {redraws} 次仍撞上 {RECENT_WINDOW_H}h 内用过的地址。"
+            f"窗口内已用 {used} 个地址。")
+        log(f"      若这经常发生，说明间隔太长或池子太小："
+            f"12h 需要 {720 // max(1, ROUND_INTERVAL_MIN)} 个不同地址。")
+    elif redraws:
+        log(f"    重摇 {redraws} 次后拿到 {RECENT_WINDOW_H}h 内未用过的地址 ✓")
+
+    # 退役 same_ip_streak：它只在「与上次**完全相同**」时递增，而实测相邻
+    # 从不相同（48h/181 周期 0 次），所以它恒为 0、tier 恒为 0，
+    # 整套分档是死代码。「重复」现在由 recent 窗口直接表达。
     state["last_ip"] = new_ip
+    state["idx"] = int(state.get("idx", 0)) + 1
+    if new_ip:
+        state["recent"] = remember_ip(state, new_ip)
     # 显式授权物化：主记账点，全新安装首轮的轮换状态靠它落盘。
     update_state({"last_ip": new_ip, "idx": state["idx"],
-                  "tier": state["tier"],
-                  "same_ip_streak": state.get("same_ip_streak", 0)},
+                  "recent": state.get("recent", [])},
                  require_existing=False)
-    log(f"--- 完成 | 节点={target} | IP={new_ip} | 档位={state['tier']+1} ---")
+    log(f"--- 完成 | 节点={target} | IP={new_ip} | "
+        f"{RECENT_WINDOW_H}h 内已用 {len(state['recent'])} 个地址 ---")
     return True
 
 
@@ -1280,14 +1342,23 @@ def show_status():
     # 它只在轮换里递增，于是出现「本轮与上次相同（累计 0）」这种自相矛盾的行。
     #
     # 真正的信号只有 same_ip_streak 一个：它是轮换自己记的、跨轮可比的。
-    streak = int(st.get("same_ip_streak") or 0)
-    if streak >= SAME_IP_WARN:
-        log(f"⚠ 轮换产出 : 连续 {streak} 轮出口 IP 未变（满 {SAME_IP_WARN} 轮告警）—— "
-            f"在换节点但没换到不同出口，项目唯一产出为零")
-    elif streak:
-        log(f"轮换产出 : 最近 {streak} 轮出口 IP 未变（满 {SAME_IP_WARN} 轮告警）")
-    else:
-        log(f"轮换产出 : 正常（最近一轮换到了新 IP）")
+    # 「重复」现在由 recent 窗口直接表达，不再靠 same_ip_streak ——
+    # 那个信号只在「与上次**完全相同**」时递增，实测 48h/181 周期 0 次触发，
+    # 恒为 0，等于没有。它与 tier 已一并退役。
+    used = recent_ips(st)
+    need = 720 // max(1, ROUND_INTERVAL_MIN)
+    # 当前 IP **本来就应该**在记忆里 —— 它是最近一次轮换记进去的。
+    # 早先这里没排除它，于是每轮都报「当前出口 IP 在 12h 记忆里」的假告警 ——
+    # 与上一轮修掉的 same_ip_streak 假告警是同一个毛病，只换了张脸。
+    # 有意义的问题是「**除了刚用过的这个**，还剩多少可用」。
+    spare = used - {ip, st.get("last_ip")}
+    log(f"轮换产出 : 窗口内已用 {len(used)} 个地址，"
+        f"当前 {ip or '(未知)'} 之外还有 {len(spare)} 个没用过")
+    if len(spare) <= 0:
+        log(f"⚠ 已无「{RECENT_WINDOW_H}h 内未用过」的地址 —— 池子抽干了。"
+            f"重摇不可能成功；需要加节点或放长间隔。")
+    log(f"12h 预算 : 需 {need} 个不同地址 / 窗口内已用 {len(used)} / "
+        f"间隔 {ROUND_INTERVAL_MIN} 分钟")
     log(f"该节点连接 : {conns_on(node)}")
     # 未降级却出现 opencode.ai 走 DIRECT = 正在泄漏，且没有任何其它信号能看见
     leaks = direct_leaks()
@@ -1308,7 +1379,7 @@ def show_status():
     if not _leak_ip_lookup_ok():
         log(f"IP 反查  : 不可用（{LEAK_HOST} 解析失败）—— 本次判定只按域名匹配，")
         log("           而 sniffer 失效正是要覆盖的场景之一。")
-    log(f"当前档位 : {st.get('tier', 0)+1} / {len(TIERS)}")
+    log(f"当前节点位 : {(int(st.get('idx', 0)) - 1) % len(NODES) + 1} / {len(NODES)}")
     log(f"配置路径 : {CONFIG_PATH} ({'存在' if os.path.exists(CONFIG_PATH) else '不存在'})")
 
 
