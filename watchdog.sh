@@ -34,8 +34,13 @@ grep -q '降级状态 : 是' <<< "$clean" && reasons+=("处于降级态：openco
 grep -q '!! 分流规则异常' <<< "$clean" && reasons+=("分流规则异常：opencode.ai 不走 AUTOFALL")
 grep -q '分流规则无法核对' <<< "$clean" && reasons+=("分流规则无法核对：判据本身失效，此刻无法判断")
 grep -q '重摇仍撞上' <<< "$clean" && reasons+=("重摇用尽仍撞上窗口内用过的地址")
-grep -q '!! 有 [0-9]* 条 opencode.ai 连接走 DIRECT' <<< "$clean" && reasons+=("检测到 opencode.ai 的连接走直连")
-grep -q 'IP 反查  : 不可用' <<< "$clean" && reasons+=("泄漏检测半盲：按 IP 反查不可用，只按域名匹配")
+# 【这条我写错过两次】真实输出是
+#   ⚠ 泄漏检测 : 有 2 条 opencode.ai 连接正在走 DIRECT！
+# 带 ⚠ 前缀、且是「连接**正在**走」。先前写成 `!! 有 N 条 …连接走 DIRECT`，
+# 同样打不中 —— 而我加的测试只锁了最初那三个死模式，所以没报出来。
+# **这正是「锁死已知死模式」这种测试的盲区：新的死模式它一律看不见。**
+grep -qE '泄漏检测 : 有 [0-9]+ 条' <<< "$clean" && reasons+=("检测到 opencode.ai 的连接走直连")
+grep -q '探测通道固定走 PROXY' <<< "$clean" && reasons+=("泄漏检测半盲：按 IP 反查不可用，只按域名匹配")
 grep -q '轮换停摆' <<< "$clean" && reasons+=("轮换停摆：定时器没在跑，或 AUTOFALL 卡住")
 grep -q '12h 预算' <<< "$clean" || reasons+=("读不到 12h 预算 —— 判据来源可能失效")
 # 「池子抽干」只在确实轮换过、且 now 无 spare 时才算数。

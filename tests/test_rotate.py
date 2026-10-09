@@ -1828,9 +1828,15 @@ class TestWatchdogPatternsMatchRealOutput(unittest.TestCase):
     """
 
     def _patterns(self):
+        """只取**真正在执行**的 grep 实参，不取注释里引用的旧写法。
+
+        注释里为了说明「先前写错过」会引用旧模式 —— 把它算进来就会误报。
+        """
         import re
         src = (ROOT / "watchdog.sh").read_text(encoding="utf-8")
-        return re.findall(r"grep -q '([^']+)'", src)
+        code = chr(10).join(l for l in src.split(chr(10))
+                            if not l.strip().startswith("#"))
+        return re.findall(r"grep -qE? '([^']+)'", code)
 
     def test_known_dead_patterns_are_gone(self):
         pats = self._patterns()
@@ -1839,6 +1845,9 @@ class TestWatchdogPatternsMatchRealOutput(unittest.TestCase):
         dead = {
             "正在泄漏": "只在 status.sh 里；--status 说的是「泄漏检测」",
             "重摇 [0-9]* 次仍撞上": "只在 rotate_once 的 journal 里，从不进 --status",
+            # 我自己后来又造的一个：真实输出带 ⚠ 前缀且是「连接**正在**走」，
+            # 而这条模式写的是 `!! …连接走 DIRECT` —— 同样打不中。
+            "连接走 DIRECT": "真实输出是「连接正在走 DIRECT」且带 ⚠ 前缀",
         }
         for pat in pats:
             for frag, why in dead.items():
@@ -1850,6 +1859,8 @@ class TestWatchdogPatternsMatchRealOutput(unittest.TestCase):
                          "--status 用的是「分流规则无法核对」，裸串打不中")
         self.assertIn("分流规则无法核对", pats)
         self.assertIn("重摇仍撞上", pats)
+        self.assertIn("泄漏检测 : 有", " ".join(pats),
+                      "泄漏判据必须写成 --status 的真实措辞")
 
     def test_status_reports_the_facts_watchdog_needs(self):
         """--status 必须报出 watchdog 依赖的那几件事。
